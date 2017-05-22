@@ -34,6 +34,7 @@ import io.netty.channel.ChannelPromiseNotifier;
 import io.netty.channel.PendingWriteQueue;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.UnsupportedMessageTypeException;
+import io.netty.util.ReferenceCounted;
 import io.netty.util.concurrent.DefaultPromise;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.Future;
@@ -580,8 +581,8 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
             // Check if queue is not empty first because create a new ChannelException is expensive
             pendingUnencryptedWrites.removeAndFailAll(new ChannelException("Pending write on removal of SslHandler"));
         }
-        if (engine instanceof ReferenceCountedOpenSslEngine) {
-            ((ReferenceCountedOpenSslEngine) engine).release();
+        if (engine instanceof ReferenceCounted) {
+            ((ReferenceCounted) engine).release();
         }
     }
 
@@ -796,9 +797,14 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
                         runDelegatedTasks();
                         break;
                     case NEED_UNWRAP:
-                        if (!inUnwrap) {
-                            unwrapNonAppData(ctx);
+                        if (inUnwrap) {
+                            // If we asked for a wrap, the engine requested an unwrap, and we are in unwrap there is
+                            // no use in trying to call wrap again because we have already attempted (or will after we
+                            // return) to feed more data to the engine.
+                            return;
                         }
+
+                        unwrapNonAppData(ctx);
                         break;
                     case NEED_WRAP:
                         break;
