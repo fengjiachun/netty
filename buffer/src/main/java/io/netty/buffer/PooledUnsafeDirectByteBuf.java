@@ -49,9 +49,9 @@ final class PooledUnsafeDirectByteBuf extends PooledByteBuf<ByteBuffer> {
     }
 
     @Override
-    void init(PoolChunk<ByteBuffer> chunk, long handle, int offset, int length, int maxLength,
-              PoolThreadCache cache) {
-        super.init(chunk, handle, offset, length, maxLength, cache);
+    void init(PoolChunk<ByteBuffer> chunk, ByteBuffer nioBuffer,
+              long handle, int offset, int length, int maxLength, PoolThreadCache cache) {
+        super.init(chunk, nioBuffer, handle, offset, length, maxLength, cache);
         initMemoryAddress();
     }
 
@@ -374,7 +374,8 @@ final class PooledUnsafeDirectByteBuf extends PooledByteBuf<ByteBuffer> {
 
     @Override
     public ByteBuf setZero(int index, int length) {
-        UnsafeByteBufUtil.setZero(this, addr(index), index, length);
+        checkIndex(index, length);
+        UnsafeByteBufUtil.setZero(addr(index), length);
         return this;
     }
 
@@ -382,7 +383,7 @@ final class PooledUnsafeDirectByteBuf extends PooledByteBuf<ByteBuffer> {
     public ByteBuf writeZero(int length) {
         ensureWritable(length);
         int wIndex = writerIndex;
-        setZero(wIndex, length);
+        UnsafeByteBufUtil.setZero(addr(wIndex), length);
         writerIndex = wIndex + length;
         return this;
     }

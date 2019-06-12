@@ -32,12 +32,16 @@ import io.netty.handler.codec.Delimiters;
 import io.netty.handler.codec.string.StringDecoder;
 import io.netty.handler.codec.string.StringEncoder;
 import io.netty.util.CharsetUtil;
+import io.netty.util.NetUtil;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.GlobalEventExecutor;
+import io.netty.util.internal.PlatformDependent;
+import org.junit.Assume;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetSocketAddress;
 import java.util.concurrent.ThreadFactory;
 
 import static org.junit.Assert.*;
@@ -51,16 +55,14 @@ public class UDTClientServerConnectionTest {
 
         static final Logger log = LoggerFactory.getLogger(Client.class);
 
-        final String host;
-        final int port;
+        private final InetSocketAddress address;
 
         volatile Channel channel;
         volatile boolean isRunning;
         volatile boolean isShutdown;
 
-        Client(final String host, final int port) {
-            this.host = host;
-            this.port = port;
+        Client(InetSocketAddress address) {
+            this.address = address;
         }
 
         @Override
@@ -88,7 +90,7 @@ public class UDTClientServerConnectionTest {
                                 pipeline.addLast("handler", new ClientHandler());
                             }
                         });
-                channel = boot.connect(host, port).sync().channel();
+                channel = boot.connect(address).sync().channel();
                 isRunning = true;
                 log.info("Client ready.");
                 waitForRunning(false);
@@ -178,16 +180,14 @@ public class UDTClientServerConnectionTest {
 
         final ChannelGroup group = new DefaultChannelGroup("server group", GlobalEventExecutor.INSTANCE);
 
-        final String host;
-        final int port;
+        private final InetSocketAddress address;
 
         volatile Channel channel;
         volatile boolean isRunning;
         volatile boolean isShutdown;
 
-        Server(final String host, final int port) {
-            this.host = host;
-            this.port = port;
+        Server(InetSocketAddress address) {
+            this.address = address;
         }
 
         @Override
@@ -218,7 +218,7 @@ public class UDTClientServerConnectionTest {
                                         group));
                             }
                         });
-                channel = boot.bind(port).sync().channel();
+                channel = boot.bind(address).sync().channel();
                 isRunning = true;
                 log.info("Server ready.");
                 waitForRunning(false);
@@ -340,19 +340,18 @@ public class UDTClientServerConnectionTest {
      */
     @Test
     public void connection() throws Exception {
-
-        final String host = "localhost";
-        final int port = 1234;
+        Assume.assumeFalse("Not supported on J9 JVM", PlatformDependent.isJ9Jvm());
 
         log.info("Starting server.");
-        final Server server = new Server(host, port);
+        // Using LOCALHOST4 as UDT transport does not support IPV6 :(
+        final Server server = new Server(new InetSocketAddress(NetUtil.LOCALHOST4, 0));
         final Thread serverTread = new Thread(server, "server-*");
         serverTread.start();
         server.waitForRunning(true);
         assertTrue(server.isRunning);
 
         log.info("Starting client.");
-        final Client client = new Client(host, port);
+        final Client client = new Client((InetSocketAddress) server.channel.localAddress());
         final Thread clientThread = new Thread(client, "client-*");
         clientThread.start();
         client.waitForRunning(true);

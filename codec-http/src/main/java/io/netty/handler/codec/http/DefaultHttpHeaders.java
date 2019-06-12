@@ -277,6 +277,32 @@ public class DefaultHttpHeaders extends HttpHeaders {
     }
 
     @Override
+    public Iterator<String> valueStringIterator(CharSequence name) {
+        final Iterator<CharSequence> itr = valueCharSequenceIterator(name);
+        return new Iterator<String>() {
+            @Override
+            public boolean hasNext() {
+                return itr.hasNext();
+            }
+
+            @Override
+            public String next() {
+                return itr.next().toString();
+            }
+
+            @Override
+            public void remove() {
+                itr.remove();
+            }
+        };
+    }
+
+    @Override
+    public Iterator<CharSequence> valueCharSequenceIterator(CharSequence name) {
+        return headers.valueIterator(name);
+    }
+
+    @Override
     public boolean contains(String name) {
         return contains((CharSequence) name);
     }
@@ -322,6 +348,11 @@ public class DefaultHttpHeaders extends HttpHeaders {
         return headers.hashCode(CASE_SENSITIVE_HASHER);
     }
 
+    @Override
+    public HttpHeaders copy() {
+        return new DefaultHttpHeaders(headers.copy());
+    }
+
     private static void validateHeaderNameElement(byte value) {
         switch (value) {
         case 0x00:
@@ -341,8 +372,7 @@ public class DefaultHttpHeaders extends HttpHeaders {
         default:
             // Check to see if the character is not an ASCII character, or invalid
             if (value < 0) {
-                throw new IllegalArgumentException("a header name cannot contain non-ASCII character: " +
-                        value);
+                throw new IllegalArgumentException("a header name cannot contain non-ASCII character: " + value);
             }
         }
     }

@@ -25,7 +25,6 @@ import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.Promise;
 import io.netty.util.concurrent.UnaryPromiseNotifier;
 import io.netty.util.internal.EmptyArrays;
-import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.UnstableApi;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -225,7 +224,12 @@ public class DefaultHttp2Connection implements Http2Connection {
     }
 
     @Override
-    public void goAwayReceived(final int lastKnownStream, long errorCode, ByteBuf debugData) {
+    public void goAwayReceived(final int lastKnownStream, long errorCode, ByteBuf debugData) throws Http2Exception {
+        if (localEndpoint.lastStreamKnownByPeer() >= 0 && localEndpoint.lastStreamKnownByPeer() < lastKnownStream) {
+            throw connectionError(PROTOCOL_ERROR, "lastStreamId MUST NOT increase. Current value: %d new value: %d",
+                    localEndpoint.lastStreamKnownByPeer(), lastKnownStream);
+        }
+
         localEndpoint.lastStreamKnownByPeer(lastKnownStream);
         for (int i = 0; i < listeners.size(); ++i) {
             try {
@@ -235,19 +239,7 @@ public class DefaultHttp2Connection implements Http2Connection {
             }
         }
 
-        try {
-            forEachActiveStream(new Http2StreamVisitor() {
-                @Override
-                public boolean visit(Http2Stream stream) {
-                    if (stream.id() > lastKnownStream && localEndpoint.isValidStreamId(stream.id())) {
-                        stream.close();
-                    }
-                    return true;
-                }
-            });
-        } catch (Http2Exception e) {
-            PlatformDependent.throwException(e);
-        }
+        closeStreamsGreaterThanLastKnownStreamId(lastKnownStream, localEndpoint);
     }
 
     @Override
@@ -256,7 +248,20 @@ public class DefaultHttp2Connection implements Http2Connection {
     }
 
     @Override
-    public void goAwaySent(final int lastKnownStream, long errorCode, ByteBuf debugData) {
+    public boolean goAwaySent(final int lastKnownStream, long errorCode, ByteBuf debugData) throws Http2Exception {
+        if (remoteEndpoint.lastStreamKnownByPeer() >= 0) {
+            // Protect against re-entrancy. Could happen if writing the frame fails, and error handling
+            // treating this is a connection handler and doing a graceful shutdown...
+            if (lastKnownStream == remoteEndpoint.lastStreamKnownByPeer()) {
+                return false;
+            }
+            if (lastKnownStream > remoteEndpoint.lastStreamKnownByPeer()) {
+                throw connectionError(PROTOCOL_ERROR, "Last stream identifier must not increase between " +
+                                "sending multiple GOAWAY frames (was '%d', is '%d').",
+                        remoteEndpoint.lastStreamKnownByPeer(), lastKnownStream);
+            }
+        }
+
         remoteEndpoint.lastStreamKnownByPeer(lastKnownStream);
         for (int i = 0; i < listeners.size(); ++i) {
             try {
@@ -266,19 +271,21 @@ public class DefaultHttp2Connection implements Http2Connection {
             }
         }
 
-        try {
-            forEachActiveStream(new Http2StreamVisitor() {
-                @Override
-                public boolean visit(Http2Stream stream) {
-                    if (stream.id() > lastKnownStream && remoteEndpoint.isValidStreamId(stream.id())) {
-                        stream.close();
-                    }
-                    return true;
+        closeStreamsGreaterThanLastKnownStreamId(lastKnownStream, remoteEndpoint);
+        return true;
+    }
+
+    private void closeStreamsGreaterThanLastKnownStreamId(final int lastKnownStream,
+                                                          final DefaultEndpoint<?> endpoint) throws Http2Exception {
+        forEachActiveStream(new Http2StreamVisitor() {
+            @Override
+            public boolean visit(Http2Stream stream) {
+                if (stream.id() > lastKnownStream && endpoint.isValidStreamId(stream.id())) {
+                    stream.close();
                 }
-            });
-        } catch (Http2Exception e) {
-            PlatformDependent.throwException(e);
-        }
+                return true;
+            }
+        });
     }
 
     /**
@@ -373,13 +380,16 @@ public class DefaultHttp2Connection implements Http2Connection {
      * Simple stream implementation. Streams can be compared to each other by priority.
      */
     private class DefaultStream implements Http2Stream {
-        private static final byte SENT_STATE_RST = 0x1;
-        private static final byte SENT_STATE_HEADERS = 0x2;
-        private static final byte SENT_STATE_PUSHPROMISE = 0x4;
+        private static final byte META_STATE_SENT_RST = 1;
+        private static final byte META_STATE_SENT_HEADERS = 1 << 1;
+        private static final byte META_STATE_SENT_TRAILERS = 1 << 2;
+        private static final byte META_STATE_SENT_PUSHPROMISE = 1 << 3;
+        private static final byte META_STATE_RECV_HEADERS = 1 << 4;
+        private static final byte META_STATE_RECV_TRAILERS = 1 << 5;
         private final int id;
         private final PropertyMap properties = new PropertyMap();
         private State state;
-        private byte sentState;
+        private byte metaState;
 
         DefaultStream(int id, State state) {
             this.id = id;
@@ -398,35 +408,60 @@ public class DefaultHttp2Connection implements Http2Connection {
 
         @Override
         public boolean isResetSent() {
-            return (sentState & SENT_STATE_RST) != 0;
+            return (metaState & META_STATE_SENT_RST) != 0;
         }
 
         @Override
         public Http2Stream resetSent() {
-            sentState |= SENT_STATE_RST;
+            metaState |= META_STATE_SENT_RST;
             return this;
         }
 
         @Override
-        public Http2Stream headersSent() {
-            sentState |= SENT_STATE_HEADERS;
+        public Http2Stream headersSent(boolean isInformational) {
+            if (!isInformational) {
+                metaState |= isHeadersSent() ? META_STATE_SENT_TRAILERS : META_STATE_SENT_HEADERS;
+            }
             return this;
         }
 
         @Override
         public boolean isHeadersSent() {
-            return (sentState & SENT_STATE_HEADERS) != 0;
+            return (metaState & META_STATE_SENT_HEADERS) != 0;
+        }
+
+        @Override
+        public boolean isTrailersSent() {
+            return (metaState & META_STATE_SENT_TRAILERS) != 0;
+        }
+
+        @Override
+        public Http2Stream headersReceived(boolean isInformational) {
+            if (!isInformational) {
+                metaState |= isHeadersReceived() ? META_STATE_RECV_TRAILERS : META_STATE_RECV_HEADERS;
+            }
+            return this;
+        }
+
+        @Override
+        public boolean isHeadersReceived() {
+            return (metaState & META_STATE_RECV_HEADERS) != 0;
+        }
+
+        @Override
+        public boolean isTrailersReceived() {
+            return (metaState & META_STATE_RECV_TRAILERS) != 0;
         }
 
         @Override
         public Http2Stream pushPromiseSent() {
-            sentState |= SENT_STATE_PUSHPROMISE;
+            metaState |= META_STATE_SENT_PUSHPROMISE;
             return this;
         }
 
         @Override
         public boolean isPushPromiseSent() {
-            return (sentState & SENT_STATE_PUSHPROMISE) != 0;
+            return (metaState & META_STATE_SENT_PUSHPROMISE) != 0;
         }
 
         @Override
@@ -450,11 +485,19 @@ public class DefaultHttp2Connection implements Http2Connection {
             if (!createdBy().canOpenStream()) {
                 throw connectionError(PROTOCOL_ERROR, "Maximum active streams violated for this endpoint.");
             }
+
             activate();
             return this;
         }
 
         void activate() {
+            // If the stream is opened in a half-closed state, the headers must have either
+            // been sent if this is a local stream, or received if it is a remote stream.
+            if (state == HALF_CLOSED_LOCAL) {
+                headersSent(/*isInformational*/ false);
+            } else if (state == HALF_CLOSED_REMOTE) {
+                headersReceived(/*isInformational*/ false);
+            }
             activeStreams.activate(this);
         }
 
@@ -599,7 +642,7 @@ public class DefaultHttp2Connection implements Http2Connection {
         }
 
         @Override
-        public Http2Stream headersSent() {
+        public Http2Stream headersSent(boolean isInformational) {
             throw new UnsupportedOperationException();
         }
 
@@ -827,10 +870,10 @@ public class DefaultHttp2Connection implements Http2Connection {
 
         private void checkNewStreamAllowed(int streamId, State state) throws Http2Exception {
             assert state != IDLE;
-            if (goAwayReceived() && streamId > localEndpoint.lastStreamKnownByPeer()) {
-                throw connectionError(PROTOCOL_ERROR, "Cannot create stream %d since this endpoint has received a " +
-                                                      "GOAWAY frame with last stream id %d.", streamId,
-                                                      localEndpoint.lastStreamKnownByPeer());
+            if (lastStreamKnownByPeer >= 0 && streamId > lastStreamKnownByPeer) {
+                throw streamError(streamId, REFUSED_STREAM,
+                        "Cannot create stream %d greater than Last-Stream-ID %d from GOAWAY.",
+                        streamId, lastStreamKnownByPeer);
             }
             if (!isValidStreamId(streamId)) {
                 if (streamId < 0) {
@@ -887,7 +930,7 @@ public class DefaultHttp2Connection implements Http2Connection {
         private final Set<Http2Stream> streams = new LinkedHashSet<Http2Stream>();
         private int pendingIterations;
 
-        public ActiveStreams(List<Listener> listeners) {
+        ActiveStreams(List<Listener> listeners) {
             this.listeners = listeners;
         }
 

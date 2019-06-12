@@ -20,6 +20,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.DecoderException;
 import io.netty.handler.codec.MessageToMessageEncoder;
 import io.netty.util.CharsetUtil;
 import io.netty.util.internal.EmptyArrays;
@@ -102,6 +103,11 @@ public final class MqttEncoder extends MessageToMessageEncoder<MqttMessage> {
         MqttVersion mqttVersion = MqttVersion.fromProtocolNameAndLevel(variableHeader.name(),
                 (byte) variableHeader.version());
 
+        // as MQTT 3.1 & 3.1.1 spec, If the User Name Flag is set to 0, the Password Flag MUST be set to 0
+        if (!variableHeader.hasUserName() && variableHeader.hasPassword()) {
+            throw new DecoderException("Without a username, the password MUST be not set");
+        }
+
         // Client id
         String clientIdentifier = payload.clientIdentifier();
         if (!isValidClientId(mqttVersion, clientIdentifier)) {
@@ -113,8 +119,8 @@ public final class MqttEncoder extends MessageToMessageEncoder<MqttMessage> {
         // Will topic and message
         String willTopic = payload.willTopic();
         byte[] willTopicBytes = willTopic != null ? encodeStringUtf8(willTopic) : EmptyArrays.EMPTY_BYTES;
-        String willMessage = payload.willMessage();
-        byte[] willMessageBytes = willMessage != null ? encodeStringUtf8(willMessage) : EmptyArrays.EMPTY_BYTES;
+        byte[] willMessage = payload.willMessageInBytes();
+        byte[] willMessageBytes = willMessage != null ? willMessage : EmptyArrays.EMPTY_BYTES;
         if (variableHeader.isWillFlag()) {
             payloadBufferSize += 2 + willTopicBytes.length;
             payloadBufferSize += 2 + willMessageBytes.length;
@@ -126,8 +132,8 @@ public final class MqttEncoder extends MessageToMessageEncoder<MqttMessage> {
             payloadBufferSize += 2 + userNameBytes.length;
         }
 
-        String password = payload.password();
-        byte[] passwordBytes = password != null ? encodeStringUtf8(password) : EmptyArrays.EMPTY_BYTES;
+        byte[] password = payload.passwordInBytes();
+        byte[] passwordBytes = password != null ? password : EmptyArrays.EMPTY_BYTES;
         if (variableHeader.hasPassword()) {
             payloadBufferSize += 2 + passwordBytes.length;
         }

@@ -15,20 +15,23 @@
  */
 package io.netty.handler.codec.http;
 
-import io.netty.util.CharsetUtil;
-import io.netty.util.ReferenceCountUtil;
-import org.junit.Test;
-
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+
+import io.netty.util.CharsetUtil;
+import io.netty.util.ReferenceCountUtil;
+import org.junit.Test;
 
 import static io.netty.handler.codec.http.HttpHeadersTestUtils.of;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class HttpUtilTest {
 
@@ -87,6 +90,22 @@ public class HttpUtilTest {
     }
 
     @Test
+    public void testGetCharsetIfNotLastParameter() {
+        String NORMAL_CONTENT_TYPE_WITH_PARAMETERS = "application/soap-xml; charset=utf-8; "
+            + "action=\"http://www.soap-service.by/foo/add\"";
+
+        HttpMessage message = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST,
+            "http://localhost:7788/foo");
+        message.headers().set(HttpHeaderNames.CONTENT_TYPE, NORMAL_CONTENT_TYPE_WITH_PARAMETERS);
+
+        assertEquals(CharsetUtil.UTF_8, HttpUtil.getCharset(message));
+        assertEquals(CharsetUtil.UTF_8, HttpUtil.getCharset(NORMAL_CONTENT_TYPE_WITH_PARAMETERS));
+
+        assertEquals("utf-8", HttpUtil.getCharsetAsSequence(message));
+        assertEquals("utf-8", HttpUtil.getCharsetAsSequence(NORMAL_CONTENT_TYPE_WITH_PARAMETERS));
+    }
+
+    @Test
     public void testGetCharset_defaultValue() {
         final String SIMPLE_CONTENT_TYPE = "text/html";
         final String CONTENT_TYPE_WITH_INCORRECT_CHARSET = "text/html; charset=UTFFF";
@@ -130,12 +149,39 @@ public class HttpUtilTest {
     }
 
     @Test
-    public void testGetContentLengthDefaultValue() {
-        HttpMessage message = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
-        assertNull(message.headers().get(HttpHeaderNames.CONTENT_LENGTH));
+    public void testGetContentLengthThrowsNumberFormatException() {
+        final HttpMessage message = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
         message.headers().set(HttpHeaderNames.CONTENT_LENGTH, "bar");
-        assertEquals("bar", message.headers().get(HttpHeaderNames.CONTENT_LENGTH));
-        assertEquals(1L, HttpUtil.getContentLength(message, 1L));
+        try {
+            HttpUtil.getContentLength(message);
+            fail();
+        } catch (final NumberFormatException e) {
+            // a number format exception is expected here
+        }
+    }
+
+    @Test
+    public void testGetContentLengthIntDefaultValueThrowsNumberFormatException() {
+        final HttpMessage message = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+        message.headers().set(HttpHeaderNames.CONTENT_LENGTH, "bar");
+        try {
+            HttpUtil.getContentLength(message, 1);
+            fail();
+        } catch (final NumberFormatException e) {
+            // a number format exception is expected here
+        }
+    }
+
+    @Test
+    public void testGetContentLengthLongDefaultValueThrowsNumberFormatException() {
+        final HttpMessage message = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+        message.headers().set(HttpHeaderNames.CONTENT_LENGTH, "bar");
+        try {
+            HttpUtil.getContentLength(message, 1L);
+            fail();
+        } catch (final NumberFormatException e) {
+            // a number format exception is expected here
+        }
     }
 
     @Test
@@ -184,7 +230,7 @@ public class HttpUtilTest {
         run100ContinueTest(message, false);
     }
 
-    private void run100ContinueTest(final HttpVersion version, final String expectations, boolean expect) {
+    private static void run100ContinueTest(final HttpVersion version, final String expectations, boolean expect) {
         final HttpMessage message = new DefaultFullHttpRequest(version, HttpMethod.GET, "/");
         if (expectations != null) {
             message.headers().set(HttpHeaderNames.EXPECT, expectations);
@@ -192,7 +238,7 @@ public class HttpUtilTest {
         run100ContinueTest(message, expect);
     }
 
-    private void run100ContinueTest(final HttpMessage message, final boolean expected) {
+    private static void run100ContinueTest(final HttpMessage message, final boolean expected) {
         assertEquals(expected, HttpUtil.is100ContinueExpected(message));
         ReferenceCountUtil.release(message);
     }
@@ -211,7 +257,8 @@ public class HttpUtilTest {
         runUnsupportedExpectationTest(message, false);
     }
 
-    private void runUnsupportedExpectationTest(final HttpVersion version, final String expectations, boolean expect) {
+    private static void runUnsupportedExpectationTest(final HttpVersion version,
+                                                      final String expectations, boolean expect) {
         final HttpMessage message = new DefaultFullHttpRequest(version, HttpMethod.GET, "/");
         if (expectations != null) {
             message.headers().set("Expect", expectations);
@@ -219,9 +266,76 @@ public class HttpUtilTest {
         runUnsupportedExpectationTest(message, expect);
     }
 
-    private void runUnsupportedExpectationTest(final HttpMessage message, final boolean expected) {
+    private static void runUnsupportedExpectationTest(final HttpMessage message, final boolean expected) {
         assertEquals(expected, HttpUtil.isUnsupportedExpectation(message));
         ReferenceCountUtil.release(message);
     }
 
+    @Test
+    public void testFormatHostnameForHttpFromResolvedAddressWithHostname() throws Exception {
+        InetSocketAddress socketAddress = new InetSocketAddress(InetAddress.getByName("localhost"), 8080);
+        assertEquals("localhost", HttpUtil.formatHostnameForHttp(socketAddress));
+    }
+
+    @Test
+    public void testFormatHostnameForHttpFromUnesolvedAddressWithHostname() {
+        InetSocketAddress socketAddress = InetSocketAddress.createUnresolved("localhost", 80);
+        assertEquals("localhost", HttpUtil.formatHostnameForHttp(socketAddress));
+    }
+
+    @Test
+    public void testIpv6() throws Exception  {
+        InetSocketAddress socketAddress = new InetSocketAddress(InetAddress.getByName("::1"), 8080);
+        assertEquals("[::1]", HttpUtil.formatHostnameForHttp(socketAddress));
+    }
+
+    @Test
+    public void testIpv6Unresolved()  {
+        InetSocketAddress socketAddress = InetSocketAddress.createUnresolved("::1", 8080);
+        assertEquals("[::1]", HttpUtil.formatHostnameForHttp(socketAddress));
+    }
+
+    @Test
+    public void testIpv4() throws Exception  {
+        InetSocketAddress socketAddress = new InetSocketAddress(InetAddress.getByName("10.0.0.1"), 8080);
+        assertEquals("10.0.0.1", HttpUtil.formatHostnameForHttp(socketAddress));
+    }
+
+    @Test
+    public void testIpv4Unresolved()  {
+        InetSocketAddress socketAddress = InetSocketAddress.createUnresolved("10.0.0.1", 8080);
+        assertEquals("10.0.0.1", HttpUtil.formatHostnameForHttp(socketAddress));
+    }
+
+    @Test
+    public void testKeepAliveIfConnectionHeaderAbsent() {
+        HttpMessage http11Message = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET,
+            "http:localhost/http_1_1");
+        assertTrue(HttpUtil.isKeepAlive(http11Message));
+
+        HttpMessage http10Message = new DefaultHttpRequest(HttpVersion.HTTP_1_0, HttpMethod.GET,
+            "http:localhost/http_1_0");
+        assertFalse(HttpUtil.isKeepAlive(http10Message));
+    }
+
+    @Test
+    public void testKeepAliveIfConnectionHeaderMultipleValues() {
+        HttpMessage http11Message = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET,
+            "http:localhost/http_1_1");
+        http11Message.headers().set(
+                HttpHeaderNames.CONNECTION, HttpHeaderValues.UPGRADE + ", " + HttpHeaderValues.CLOSE);
+        assertFalse(HttpUtil.isKeepAlive(http11Message));
+
+        http11Message.headers().set(
+                HttpHeaderNames.CONNECTION, HttpHeaderValues.UPGRADE + ", Close");
+        assertFalse(HttpUtil.isKeepAlive(http11Message));
+
+        http11Message.headers().set(
+                HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE + ", " + HttpHeaderValues.UPGRADE);
+        assertFalse(HttpUtil.isKeepAlive(http11Message));
+
+        http11Message.headers().set(
+                HttpHeaderNames.CONNECTION, HttpHeaderValues.UPGRADE + ", " + HttpHeaderValues.KEEP_ALIVE);
+        assertTrue(HttpUtil.isKeepAlive(http11Message));
+    }
 }

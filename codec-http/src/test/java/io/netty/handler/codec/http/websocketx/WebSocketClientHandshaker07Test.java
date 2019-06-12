@@ -15,41 +15,39 @@
  */
 package io.netty.handler.codec.http.websocketx;
 
-import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpHeaderNames;
-import org.junit.Test;
+import io.netty.handler.codec.http.HttpHeaders;
 
 import java.net.URI;
 
-import static org.junit.Assert.assertEquals;
-
 public class WebSocketClientHandshaker07Test extends WebSocketClientHandshakerTest {
     @Override
-    protected WebSocketClientHandshaker newHandshaker(URI uri) {
-        return new WebSocketClientHandshaker07(uri, WebSocketVersion.V07, null, false, null, 1024);
+    protected WebSocketClientHandshaker newHandshaker(URI uri, String subprotocol, HttpHeaders headers,
+                                                      boolean absoluteUpgradeUrl) {
+        return new WebSocketClientHandshaker07(uri, WebSocketVersion.V07, subprotocol, false, headers,
+          1024, true, false, 10000,
+          absoluteUpgradeUrl);
     }
 
-    @Test
-    public void testSecOriginWss() {
-        URI uri = URI.create("wss://localhost/path%20with%20ws");
-        WebSocketClientHandshaker handshaker = newHandshaker(uri);
-        FullHttpRequest request = handshaker.newHandshakeRequest();
-        try {
-            assertEquals("https://localhost", request.headers().get(HttpHeaderNames.SEC_WEBSOCKET_ORIGIN));
-        } finally {
-            request.release();
-        }
+    @Override
+    protected CharSequence getOriginHeaderName() {
+        return HttpHeaderNames.SEC_WEBSOCKET_ORIGIN;
     }
 
-    @Test
-    public void testSecOriginWs() {
-        URI uri = URI.create("ws://localhost/path%20with%20ws");
-        WebSocketClientHandshaker handshaker = newHandshaker(uri);
-        FullHttpRequest request = handshaker.newHandshakeRequest();
-        try {
-            assertEquals("http://localhost", request.headers().get(HttpHeaderNames.SEC_WEBSOCKET_ORIGIN));
-        } finally {
-            request.release();
-        }
+    @Override
+    protected CharSequence getProtocolHeaderName() {
+        return HttpHeaderNames.SEC_WEBSOCKET_PROTOCOL;
+    }
+
+    @Override
+    protected CharSequence[] getHandshakeHeaderNames() {
+        return new CharSequence[] {
+                HttpHeaderNames.UPGRADE,
+                HttpHeaderNames.CONNECTION,
+                HttpHeaderNames.SEC_WEBSOCKET_KEY,
+                HttpHeaderNames.HOST,
+                HttpHeaderNames.SEC_WEBSOCKET_ORIGIN,
+                HttpHeaderNames.SEC_WEBSOCKET_VERSION,
+        };
     }
 }

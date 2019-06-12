@@ -17,6 +17,7 @@ package io.netty.handler.codec.http;
 
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.TooLongFrameException;
 import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
 import org.junit.Test;
@@ -80,7 +81,7 @@ public class HttpRequestDecoderTest {
 
     private static void testDecodeWholeRequestAtOnce(byte[] content) {
         EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
-        assertTrue(channel.writeInbound(Unpooled.wrappedBuffer(content)));
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(content)));
         HttpRequest req = channel.readInbound();
         assertNotNull(req);
         checkHeaders(req.headers());
@@ -145,13 +146,13 @@ public class HttpRequestDecoderTest {
             }
 
             // if header is done it should produce a HttpRequest
-            channel.writeInbound(Unpooled.wrappedBuffer(content, a, amount));
+            channel.writeInbound(Unpooled.copiedBuffer(content, a, amount));
             a += amount;
         }
 
         for (int i = CONTENT_LENGTH; i > 0; i --) {
             // Should produce HttpContent
-            channel.writeInbound(Unpooled.wrappedBuffer(content, content.length - i, 1));
+            channel.writeInbound(Unpooled.copiedBuffer(content, content.length - i, 1));
         }
 
         HttpRequest req = channel.readInbound();
@@ -175,13 +176,36 @@ public class HttpRequestDecoderTest {
     }
 
     @Test
+    public void testMultiLineHeader() {
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        String crlf = "\r\n";
+        String request =  "GET /some/path HTTP/1.1" + crlf +
+                "Host: localhost" + crlf +
+                "MyTestHeader: part1" + crlf +
+                "              newLinePart2" + crlf +
+                "MyTestHeader2: part21" + crlf +
+                "\t            newLinePart22"
+                + crlf + crlf;
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(request, CharsetUtil.US_ASCII)));
+        HttpRequest req = channel.readInbound();
+        assertEquals("part1 newLinePart2", req.headers().get(of("MyTestHeader")));
+        assertEquals("part21 newLinePart22", req.headers().get(of("MyTestHeader2")));
+
+        LastHttpContent c = channel.readInbound();
+        c.release();
+
+        assertFalse(channel.finish());
+        assertNull(channel.readInbound());
+    }
+
+    @Test
     public void testEmptyHeaderValue() {
         EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
         String crlf = "\r\n";
         String request =  "GET /some/path HTTP/1.1" + crlf +
                 "Host: localhost" + crlf +
                 "EmptyHeader:" + crlf + crlf;
-        channel.writeInbound(Unpooled.wrappedBuffer(request.getBytes(CharsetUtil.US_ASCII)));
+        channel.writeInbound(Unpooled.copiedBuffer(request, CharsetUtil.US_ASCII));
         HttpRequest req = channel.readInbound();
         assertEquals("", req.headers().get(of("EmptyHeader")));
     }
@@ -269,5 +293,31 @@ public class HttpRequestDecoderTest {
         cnt = channel.readInbound();
         cnt.release();
         assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @Test
+    public void testTooLargeInitialLine() {
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder(10, 1024, 1024));
+        String requestStr = "GET /some/path HTTP/1.1\r\n" +
+                "Host: localhost1\r\n\r\n";
+
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertTrue(request.decoderResult().isFailure());
+        assertTrue(request.decoderResult().cause() instanceof TooLongFrameException);
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    public void testTooLargeHeaders() {
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder(1024, 10, 1024));
+        String requestStr = "GET /some/path HTTP/1.1\r\n" +
+                "Host: localhost1\r\n\r\n";
+
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertTrue(request.decoderResult().isFailure());
+        assertTrue(request.decoderResult().cause() instanceof TooLongFrameException);
+        assertFalse(channel.finish());
     }
 }

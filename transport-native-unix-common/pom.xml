@@ -19,7 +19,7 @@
   <parent>
     <groupId>io.netty</groupId>
     <artifactId>netty-parent</artifactId>
-    <version>4.1.12.Final-SNAPSHOT</version>
+    <version>4.1.37.Final-SNAPSHOT</version>
   </parent>
   <artifactId>netty-transport-native-unix-common</artifactId>
 
@@ -30,6 +30,8 @@
   </description>
 
   <properties>
+    <javaModuleName>io.netty.transport.unix.common</javaModuleName>
+
     <exe.make>make</exe.make>
     <exe.compiler>gcc</exe.compiler>
     <exe.archiver>ar</exe.archiver>
@@ -99,9 +101,13 @@
                       <env key="LIB_DIR" value="${nativeLibOnlyDir}" />
                       <env key="OBJ_DIR" value="${nativeObjsOnlyDir}" />
                       <env key="JNI_PLATFORM" value="${jni.platform}" />
-                      <env key="CFLAGS" value="-O3 -Werror -Wno-attributes -fPIC -fno-omit-frame-pointer -Wunused-variable" />
+                      <env key="CFLAGS" value="-O3 -Werror -Wno-attributes -fPIC -fno-omit-frame-pointer -Wunused-variable -fvisibility=hidden" />
                       <env key="LDFLAGS" value="-Wl,--no-as-needed -lrt" />
                       <env key="LIB_NAME" value="${nativeLibName}" />
+                      <!-- support for __attribute__((weak_import)) by the linker was added in 10.2 so ensure we
+                           explicitly set the target platform. Otherwise we may get fatal link errors due to weakly linked
+                           methods which are not expected to be present on MacOS (e.g. accept4). -->
+                      <env key="MACOSX_DEPLOYMENT_TARGET" value="10.2" />
                     </exec>
                   </target>
                 </configuration>
@@ -166,7 +172,7 @@
                       <env key="LIB_DIR" value="${nativeLibOnlyDir}" />
                       <env key="OBJ_DIR" value="${nativeObjsOnlyDir}" />
                       <env key="JNI_PLATFORM" value="${jni.platform}" />
-                      <env key="CFLAGS" value="-O3 -Werror -Wno-attributes -fPIC -fno-omit-frame-pointer -Wunused-variable" />
+                      <env key="CFLAGS" value="-O3 -Werror -Wno-attributes -fPIC -fno-omit-frame-pointer -Wunused-variable -fvisibility=hidden" />
                       <env key="LDFLAGS" value="-Wl,--no-as-needed -lrt" />
                       <env key="LIB_NAME" value="${nativeLibName}" />
                     </exec>
@@ -236,7 +242,7 @@
                       <env key="LIB_DIR" value="${nativeLibOnlyDir}" />
                       <env key="OBJ_DIR" value="${nativeObjsOnlyDir}" />
                       <env key="JNI_PLATFORM" value="${jni.platform}" />
-                      <env key="CFLAGS" value="-O3 -Werror -Wno-attributes -fPIC -fno-omit-frame-pointer -Wunused-variable" />
+                      <env key="CFLAGS" value="-O3 -Werror -Wno-attributes -fPIC -fno-omit-frame-pointer -Wunused-variable -fvisibility=hidden" />
                       <env key="LDFLAGS" value="-Wl,--no-as-needed -lrt" />
                       <env key="LIB_NAME" value="${nativeLibName}" />
                     </exec>
@@ -306,7 +312,7 @@
                       <env key="LIB_DIR" value="${nativeLibOnlyDir}" />
                       <env key="OBJ_DIR" value="${nativeObjsOnlyDir}" />
                       <env key="JNI_PLATFORM" value="${jni.platform}" />
-                      <env key="CFLAGS" value="-O3 -Werror -Wno-attributes -fPIC -fno-omit-frame-pointer -Wunused-variable" />
+                      <env key="CFLAGS" value="-O3 -Werror -Wno-attributes -fPIC -fno-omit-frame-pointer -Wunused-variable -fvisibility=hidden" />
                       <env key="LDFLAGS" value="-Wl,--no-as-needed -lrt" />
                       <env key="LIB_NAME" value="${nativeLibName}" />
                     </exec>
@@ -324,6 +330,11 @@
     <dependency>
       <groupId>io.netty</groupId>
       <artifactId>netty-common</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-buffer</artifactId>
       <version>${project.version}</version>
     </dependency>
     <dependency>

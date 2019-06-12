@@ -88,6 +88,16 @@ public final class Http2ConnectionHandlerBuilder
     }
 
     @Override
+    public Http2ConnectionHandlerBuilder initialHuffmanDecodeCapacity(int initialHuffmanDecodeCapacity) {
+        return super.initialHuffmanDecodeCapacity(initialHuffmanDecodeCapacity);
+    }
+
+    @Override
+    public Http2ConnectionHandlerBuilder decoupleCloseAndGoAway(boolean decoupleCloseAndGoAway) {
+        return super.decoupleCloseAndGoAway(decoupleCloseAndGoAway);
+    }
+
+    @Override
     public Http2ConnectionHandler build() {
         return super.build();
     }
@@ -95,6 +105,6 @@ public final class Http2ConnectionHandlerBuilder
     @Override
     protected Http2ConnectionHandler build(Http2ConnectionDecoder decoder, Http2ConnectionEncoder encoder,
                                            Http2Settings initialSettings) {
-        return new Http2ConnectionHandler(decoder, encoder, initialSettings);
+        return new Http2ConnectionHandler(decoder, encoder, initialSettings, decoupleCloseAndGoAway());
     }
 }

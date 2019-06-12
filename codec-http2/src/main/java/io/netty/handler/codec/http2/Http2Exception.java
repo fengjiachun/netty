@@ -15,6 +15,8 @@
 
 package io.netty.handler.codec.http2;
 
+import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.SuppressJava6Requirement;
 import io.netty.util.internal.UnstableApi;
 
 import java.util.ArrayList;
@@ -58,6 +60,22 @@ public class Http2Exception extends Exception {
 
     public Http2Exception(Http2Error error, String message, Throwable cause, ShutdownHint shutdownHint) {
         super(message, cause);
+        this.error = checkNotNull(error, "error");
+        this.shutdownHint = checkNotNull(shutdownHint, "shutdownHint");
+    }
+
+    static Http2Exception newStatic(Http2Error error, String message, ShutdownHint shutdownHint) {
+        if (PlatformDependent.javaVersion() >= 7) {
+            return new Http2Exception(error, message, shutdownHint, true);
+        }
+        return new Http2Exception(error, message, shutdownHint);
+    }
+
+    @SuppressJava6Requirement(reason = "uses Java 7+ Exception.<init>(String, Throwable, boolean, boolean)" +
+            " but is guarded by version checks")
+    private Http2Exception(Http2Error error, String message, ShutdownHint shutdownHint, boolean shared) {
+        super(message, null, false, true);
+        assert shared;
         this.error = checkNotNull(error, "error");
         this.shutdownHint = checkNotNull(shutdownHint, "shutdownHint");
     }
@@ -194,7 +212,7 @@ public class Http2Exception extends Exception {
     /**
      * Provides a hint as to if shutdown is justified, what type of shutdown should be executed.
      */
-    public static enum ShutdownHint {
+    public enum ShutdownHint {
         /**
          * Do not shutdown the underlying channel.
          */
@@ -252,6 +270,8 @@ public class Http2Exception extends Exception {
     }
 
     public static final class HeaderListSizeException extends StreamException {
+        private static final long serialVersionUID = -8807603212183882637L;
+
         private final boolean decode;
 
         HeaderListSizeException(int streamId, Http2Error error, String message, boolean decode) {

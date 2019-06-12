@@ -16,6 +16,7 @@
 package io.netty.channel.epoll;
 
 import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.socket.InternetProtocolFamily;
 import io.netty.testsuite.transport.TestsuitePermutation;
 import io.netty.testsuite.transport.socket.DatagramUnicastTest;
 
@@ -24,6 +25,13 @@ import java.util.List;
 public class EpollDatagramUnicastTest extends DatagramUnicastTest {
     @Override
     protected List<TestsuitePermutation.BootstrapComboFactory<Bootstrap, Bootstrap>> newFactories() {
-        return EpollSocketTestPermutation.INSTANCE.datagram();
+        return EpollSocketTestPermutation.INSTANCE.datagram(InternetProtocolFamily.IPv4);
+    }
+
+    public void testSimpleSendWithConnect(Bootstrap sb, Bootstrap cb) throws Throwable {
+        // Run this test with IP_RECVORIGDSTADDR option enabled
+        sb.option(EpollChannelOption.IP_RECVORIGDSTADDR, true);
+        super.testSimpleSendWithConnect(sb, cb);
+        sb.option(EpollChannelOption.IP_RECVORIGDSTADDR, false);
     }
 }

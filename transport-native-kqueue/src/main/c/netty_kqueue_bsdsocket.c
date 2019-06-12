@@ -24,11 +24,13 @@
 #include <sys/ucred.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include "netty_unix_filedescriptor.h"
-#include "netty_unix_socket.h"
-#include "netty_unix_errors.h"
-#include "netty_unix_util.h"
+
 #include "netty_kqueue_bsdsocket.h"
+#include "netty_unix_errors.h"
+#include "netty_unix_filedescriptor.h"
+#include "netty_unix_jni.h"
+#include "netty_unix_socket.h"
+#include "netty_unix_util.h"
 
 // Those are initialized in the init(...) method and cached for performance reasons
 static jclass stringCls = NULL;
@@ -157,8 +159,16 @@ static jobject netty_kqueue_bsdsocket_getPeerCredentials(JNIEnv *env, jclass cla
         (*env)->SetIntArrayRegion(env, gids, 0, 1, (jint*) &credentials.cr_gid);
     }
 
-    // TODO: getting the PID may require reading/sending "ancillary data" via SCM_CREDENTIALS which is not desirable.
-    return (*env)->NewObject(env, peerCredentialsClass, peerCredentialsMethodId, 0, credentials.cr_uid, gids);
+    pid_t pid = 0;
+#ifdef LOCAL_PEERPID
+    socklen_t len = sizeof(pid);
+    // Getting the LOCAL_PEERPID is expected to return error in some cases (e.g. server socket FDs) - just return 0.
+    if (netty_unix_socket_getOption0(fd, SOCK_STREAM, LOCAL_PEERPID, &pid, len) < 0) {
+        pid = 0;
+    }
+#endif
+
+    return (*env)->NewObject(env, peerCredentialsClass, peerCredentialsMethodId, pid, credentials.cr_uid, gids);
 }
 // JNI Registered Methods End
 
@@ -288,7 +298,7 @@ jint netty_kqueue_bsdsocket_JNI_OnLoad(JNIEnv* env, const char* packagePrefix) {
         return JNI_ERR;
     }
 
-    return JNI_VERSION_1_6;
+    return NETTY_JNI_VERSION;
 }
 
 void netty_kqueue_bsdsocket_JNI_OnUnLoad(JNIEnv* env) {

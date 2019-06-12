@@ -64,7 +64,7 @@ abstract class AbstractUnsafeSwappedByteBuf extends SwappedByteBuf {
 
     @Override
     public final int getInt(int index) {
-        wrapped.checkIndex0(index, 4);
+        wrapped.checkIndex(index, 4);
         int v = _getInt(wrapped, index);
         return nativeByteOrder ? v : Integer.reverseBytes(v);
     }
@@ -76,21 +76,21 @@ abstract class AbstractUnsafeSwappedByteBuf extends SwappedByteBuf {
 
     @Override
     public final short getShort(int index) {
-        wrapped.checkIndex0(index, 2);
+        wrapped.checkIndex(index, 2);
         short v = _getShort(wrapped, index);
         return nativeByteOrder ? v : Short.reverseBytes(v);
     }
 
     @Override
     public final ByteBuf setShort(int index, int value) {
-        wrapped.checkIndex0(index, 2);
+        wrapped.checkIndex(index, 2);
         _setShort(wrapped, index, nativeByteOrder ? (short) value : Short.reverseBytes((short) value));
         return this;
     }
 
     @Override
     public final ByteBuf setInt(int index, int value) {
-        wrapped.checkIndex0(index, 4);
+        wrapped.checkIndex(index, 4);
         _setInt(wrapped, index, nativeByteOrder ? value : Integer.reverseBytes(value));
         return this;
     }
@@ -122,7 +122,7 @@ abstract class AbstractUnsafeSwappedByteBuf extends SwappedByteBuf {
 
     @Override
     public final ByteBuf writeShort(int value) {
-        wrapped.ensureWritable(2);
+        wrapped.ensureWritable0(2);
         _setShort(wrapped, wrapped.writerIndex, nativeByteOrder ? (short) value : Short.reverseBytes((short) value));
         wrapped.writerIndex += 2;
         return this;
@@ -130,7 +130,7 @@ abstract class AbstractUnsafeSwappedByteBuf extends SwappedByteBuf {
 
     @Override
     public final ByteBuf writeInt(int value) {
-        wrapped.ensureWritable(4);
+        wrapped.ensureWritable0(4);
         _setInt(wrapped, wrapped.writerIndex, nativeByteOrder ? value : Integer.reverseBytes(value));
         wrapped.writerIndex += 4;
         return this;
@@ -138,7 +138,7 @@ abstract class AbstractUnsafeSwappedByteBuf extends SwappedByteBuf {
 
     @Override
     public final ByteBuf writeLong(long value) {
-        wrapped.ensureWritable(8);
+        wrapped.ensureWritable0(8);
         _setLong(wrapped, wrapped.writerIndex, nativeByteOrder ? value : Long.reverseBytes(value));
         wrapped.writerIndex += 8;
         return this;

@@ -39,7 +39,7 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
     }
 
     AbstractEpollServerChannel(LinuxSocket fd, boolean active) {
-        super(null, fd, Native.EPOLLIN, active);
+        super(null, fd, active);
     }
 
     @Override
@@ -133,5 +133,10 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
                 epollInFinally(config);
             }
         }
+    }
+
+    @Override
+    protected boolean doConnect(SocketAddress remoteAddress, SocketAddress localAddress) throws Exception {
+        throw new UnsupportedOperationException();
     }
 }

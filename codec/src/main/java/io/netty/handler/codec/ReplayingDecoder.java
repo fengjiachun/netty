@@ -327,11 +327,10 @@ public abstract class ReplayingDecoder<S> extends ByteToMessageDecoder {
             replayable.terminate();
             if (cumulation != null) {
                 callDecode(ctx, internalBuffer(), out);
-                decodeLast(ctx, replayable, out);
             } else {
                 replayable.setCumulation(Unpooled.EMPTY_BUFFER);
-                decodeLast(ctx, replayable, out);
             }
+            decodeLast(ctx, replayable, out);
         } catch (Signal replay) {
             // Ignore
             replay.expect(REPLAY);
@@ -418,7 +417,7 @@ public abstract class ReplayingDecoder<S> extends ByteToMessageDecoder {
             }
         } catch (DecoderException e) {
             throw e;
-        } catch (Throwable cause) {
+        } catch (Exception cause) {
             throw new DecoderException(cause);
         }
     }

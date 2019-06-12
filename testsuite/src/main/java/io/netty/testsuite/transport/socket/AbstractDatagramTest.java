@@ -18,17 +18,16 @@ package io.netty.testsuite.transport.socket;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.ChannelOption;
+import io.netty.channel.socket.InternetProtocolFamily;
 import io.netty.testsuite.transport.AbstractComboTestsuiteTest;
 import io.netty.testsuite.transport.TestsuitePermutation;
-import io.netty.testsuite.util.TestUtils;
 import io.netty.util.NetUtil;
 
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.List;
 
 public abstract class AbstractDatagramTest extends AbstractComboTestsuiteTest<Bootstrap, Bootstrap> {
-
-    protected volatile InetSocketAddress addr;
 
     protected AbstractDatagramTest() {
         super(Bootstrap.class, Bootstrap.class);
@@ -36,21 +35,27 @@ public abstract class AbstractDatagramTest extends AbstractComboTestsuiteTest<Bo
 
     @Override
     protected List<TestsuitePermutation.BootstrapComboFactory<Bootstrap, Bootstrap>> newFactories() {
-        return SocketTestPermutation.INSTANCE.datagram();
+        return SocketTestPermutation.INSTANCE.datagram(internetProtocolFamily());
     }
 
     @Override
     protected void configure(Bootstrap bootstrap, Bootstrap bootstrap2, ByteBufAllocator allocator) {
-        addr = new InetSocketAddress(
-                NetUtil.LOCALHOST4, TestUtils.getFreePort());
-        bootstrap.localAddress(addr);
         bootstrap.option(ChannelOption.ALLOCATOR, allocator);
-        bootstrap2.localAddress(0).remoteAddress(addr);
         bootstrap2.option(ChannelOption.ALLOCATOR, allocator);
     }
 
-    protected void refreshLocalAddress(Bootstrap bootstrap) {
-        addr = new InetSocketAddress(NetUtil.LOCALHOST4, TestUtils.getFreePort());
-        bootstrap.localAddress(addr);
+    protected SocketAddress newSocketAddress() {
+        switch (internetProtocolFamily()) {
+            case IPv4:
+                return new InetSocketAddress(NetUtil.LOCALHOST4, 0);
+            case IPv6:
+                return new InetSocketAddress(NetUtil.LOCALHOST6, 0);
+            default:
+                throw new AssertionError();
+        }
+    }
+
+    protected InternetProtocolFamily internetProtocolFamily() {
+        return InternetProtocolFamily.IPv4;
     }
 }

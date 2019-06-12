@@ -73,13 +73,12 @@ import java.lang.annotation.Target;
  *
  *     {@code @Override}
  *     public void channelRead0({@link ChannelHandlerContext} ctx, Message message) {
- *         {@link Channel} ch = e.getChannel();
  *         if (message instanceof LoginMessage) {
  *             authenticate((LoginMessage) message);
  *             <b>loggedIn = true;</b>
  *         } else (message instanceof GetDataMessage) {
  *             if (<b>loggedIn</b>) {
- *                 ch.write(fetchSecret((GetDataMessage) message));
+ *                 ctx.writeAndFlush(fetchSecret((GetDataMessage) message));
  *             } else {
  *                 fail();
  *             }
@@ -123,13 +122,12 @@ import java.lang.annotation.Target;
  *     {@code @Override}
  *     public void channelRead({@link ChannelHandlerContext} ctx, Message message) {
  *         {@link Attribute}&lt;{@link Boolean}&gt; attr = ctx.attr(auth);
- *         {@link Channel} ch = ctx.channel();
  *         if (message instanceof LoginMessage) {
  *             authenticate((LoginMessage) o);
  *             <b>attr.set(true)</b>;
  *         } else (message instanceof GetDataMessage) {
  *             if (<b>Boolean.TRUE.equals(attr.get())</b>) {
- *                 ch.write(fetchSecret((GetDataMessage) o));
+ *                 ctx.writeAndFlush(fetchSecret((GetDataMessage) o));
  *             } else {
  *                 fail();
  *             }
@@ -193,7 +191,8 @@ public interface ChannelHandler {
     /**
      * Gets called if a {@link Throwable} was thrown.
      *
-     * @deprecated is part of {@link ChannelInboundHandler}
+     * @deprecated if you want to handle this event you should implement {@link ChannelInboundHandler} and
+     * implement the method there.
      */
     @Deprecated
     void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception;

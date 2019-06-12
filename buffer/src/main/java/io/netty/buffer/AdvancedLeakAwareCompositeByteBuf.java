@@ -940,6 +940,12 @@ final class AdvancedLeakAwareCompositeByteBuf extends SimpleLeakAwareCompositeBy
     }
 
     @Override
+    public CompositeByteBuf addFlattenedComponents(boolean increaseWriterIndex, ByteBuf buffer) {
+        recordLeakNonRefCountingOperation(leak);
+        return super.addFlattenedComponents(increaseWriterIndex, buffer);
+    }
+
+    @Override
     public CompositeByteBuf removeComponent(int cIndex) {
         recordLeakNonRefCountingOperation(leak);
         return super.removeComponent(cIndex);
@@ -1015,6 +1021,18 @@ final class AdvancedLeakAwareCompositeByteBuf extends SimpleLeakAwareCompositeBy
     public CompositeByteBuf retain(int increment) {
         leak.record();
         return super.retain(increment);
+    }
+
+    @Override
+    public boolean release() {
+        leak.record();
+        return super.release();
+    }
+
+    @Override
+    public boolean release(int decrement) {
+        leak.record();
+        return super.release(decrement);
     }
 
     @Override

@@ -20,11 +20,14 @@ import io.netty.channel.EventLoop;
 import io.netty.channel.ReflectiveChannelFactory;
 import io.netty.channel.socket.DatagramChannel;
 import io.netty.channel.socket.InternetProtocolFamily;
+import io.netty.channel.socket.SocketChannel;
 import io.netty.resolver.HostsFileEntriesResolver;
 import io.netty.resolver.ResolvedAddressTypes;
+import io.netty.util.concurrent.Future;
 import io.netty.util.internal.UnstableApi;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static io.netty.resolver.dns.DnsServerAddressStreamProviders.platformDefault;
@@ -36,15 +39,18 @@ import static io.netty.util.internal.ObjectUtil.intValue;
  */
 @UnstableApi
 public final class DnsNameResolverBuilder {
-    private final EventLoop eventLoop;
+    private EventLoop eventLoop;
     private ChannelFactory<? extends DatagramChannel> channelFactory;
+    private ChannelFactory<? extends SocketChannel> socketChannelFactory;
     private DnsCache resolveCache;
-    private DnsCache authoritativeDnsServerCache;
+    private DnsCnameCache cnameCache;
+    private AuthoritativeDnsServerCache authoritativeDnsServerCache;
     private Integer minTtl;
     private Integer maxTtl;
     private Integer negativeTtl;
     private long queryTimeoutMillis = 5000;
     private ResolvedAddressTypes resolvedAddressTypes = DnsNameResolver.DEFAULT_RESOLVE_ADDRESS_TYPES;
+    private boolean completeOncePreferredResolved;
     private boolean recursionDesired = true;
     private int maxQueriesPerResolve = 16;
     private boolean traceEnabled;
@@ -54,18 +60,39 @@ public final class DnsNameResolverBuilder {
     private DnsServerAddressStreamProvider dnsServerAddressStreamProvider = platformDefault();
     private DnsQueryLifecycleObserverFactory dnsQueryLifecycleObserverFactory =
             NoopDnsQueryLifecycleObserverFactory.INSTANCE;
-    private String[] searchDomains = DnsNameResolver.DEFAULT_SEARCH_DOMAINS;
-    private int ndots = 1;
+    private String[] searchDomains;
+    private int ndots = -1;
     private boolean decodeIdn = true;
 
     /**
      * Creates a new builder.
+     */
+    public DnsNameResolverBuilder() {
+    }
+
+    /**
+     * Creates a new builder.
      *
-     * @param eventLoop the {@link EventLoop} the {@link EventLoop} which will perform the communication with the DNS
+     * @param eventLoop the {@link EventLoop} which will perform the communication with the DNS
      * servers.
      */
     public DnsNameResolverBuilder(EventLoop eventLoop) {
+        eventLoop(eventLoop);
+    }
+
+    /**
+     * Sets the {@link EventLoop} which will perform the communication with the DNS servers.
+     *
+     * @param eventLoop the {@link EventLoop}
+     * @return {@code this}
+     */
+    public DnsNameResolverBuilder eventLoop(EventLoop eventLoop) {
         this.eventLoop = eventLoop;
+        return this;
+    }
+
+    protected ChannelFactory<? extends DatagramChannel> channelFactory() {
+        return this.channelFactory;
     }
 
     /**
@@ -91,6 +118,35 @@ public final class DnsNameResolverBuilder {
     }
 
     /**
+     * Sets the {@link ChannelFactory} that will create a {@link SocketChannel} for
+     * <a href="https://tools.ietf.org/html/rfc7766">TCP fallback</a> if needed.
+     *
+     * @param channelFactory the {@link ChannelFactory} or {@code null}
+     *                       if <a href="https://tools.ietf.org/html/rfc7766">TCP fallback</a> should not be supported.
+     * @return {@code this}
+     */
+    public DnsNameResolverBuilder socketChannelFactory(ChannelFactory<? extends SocketChannel> channelFactory) {
+        this.socketChannelFactory = channelFactory;
+        return this;
+    }
+
+    /**
+     * Sets the {@link ChannelFactory} as a {@link ReflectiveChannelFactory} of this type for
+     * <a href="https://tools.ietf.org/html/rfc7766">TCP fallback</a> if needed.
+     * Use as an alternative to {@link #socketChannelFactory(ChannelFactory)}.
+     *
+     * @param channelType the type or {@code null} if <a href="https://tools.ietf.org/html/rfc7766">TCP fallback</a>
+     *                    should not be supported.
+     * @return {@code this}
+     */
+    public DnsNameResolverBuilder socketChannelType(Class<? extends SocketChannel> channelType) {
+        if (channelType == null) {
+            return socketChannelFactory(null);
+        }
+        return socketChannelFactory(new ReflectiveChannelFactory<SocketChannel>(channelType));
+    }
+
+    /**
      * Sets the cache for resolution results.
      *
      * @param resolveCache the DNS resolution results cache
@@ -98,6 +154,17 @@ public final class DnsNameResolverBuilder {
      */
     public DnsNameResolverBuilder resolveCache(DnsCache resolveCache) {
         this.resolveCache  = resolveCache;
+        return this;
+    }
+
+    /**
+     * Sets the cache for {@code CNAME} mappings.
+     *
+     * @param cnameCache the cache used to cache {@code CNAME} mappings for a domain.
+     * @return {@code this}
+     */
+    public DnsNameResolverBuilder cnameCache(DnsCnameCache cnameCache) {
+        this.cnameCache  = cnameCache;
         return this;
     }
 
@@ -117,8 +184,21 @@ public final class DnsNameResolverBuilder {
      *
      * @param authoritativeDnsServerCache the authoritative NS servers cache
      * @return {@code this}
+     * @deprecated Use {@link #authoritativeDnsServerCache(AuthoritativeDnsServerCache)}
      */
+    @Deprecated
     public DnsNameResolverBuilder authoritativeDnsServerCache(DnsCache authoritativeDnsServerCache) {
+        this.authoritativeDnsServerCache = new AuthoritativeDnsServerCacheAdapter(authoritativeDnsServerCache);
+        return this;
+    }
+
+    /**
+     * Sets the cache for authoritative NS servers
+     *
+     * @param authoritativeDnsServerCache the authoritative NS servers cache
+     * @return {@code this}
+     */
+    public DnsNameResolverBuilder authoritativeDnsServerCache(AuthoritativeDnsServerCache authoritativeDnsServerCache) {
         this.authoritativeDnsServerCache = authoritativeDnsServerCache;
         return this;
     }
@@ -207,6 +287,18 @@ public final class DnsNameResolverBuilder {
     }
 
     /**
+     * If {@code true} {@link DnsNameResolver#resolveAll(String)} will notify the returned {@link Future} as
+     * soon as all queries for the preferred address-type are complete.
+     *
+     * @param completeOncePreferredResolved {@code true} to enable, {@code false} to disable.
+     * @return {@code this}
+     */
+    public DnsNameResolverBuilder completeOncePreferredResolved(boolean completeOncePreferredResolved) {
+        this.completeOncePreferredResolved = completeOncePreferredResolved;
+        return this;
+    }
+
+    /**
      * Sets if this resolver has to send a DNS query with the RD (recursion desired) flag set.
      *
      * @param recursionDesired true if recursion is desired
@@ -274,6 +366,10 @@ public final class DnsNameResolverBuilder {
         return this;
     }
 
+    protected DnsServerAddressStreamProvider nameServerProvider() {
+        return this.dnsServerAddressStreamProvider;
+    }
+
     /**
      * Set the {@link DnsServerAddressStreamProvider} which is used to determine which DNS server is used to resolve
      * each hostname.
@@ -309,7 +405,7 @@ public final class DnsNameResolverBuilder {
             list.add(f);
         }
 
-        this.searchDomains = list.toArray(new String[list.size()]);
+        this.searchDomains = list.toArray(new String[0]);
         return this;
     }
 
@@ -327,6 +423,19 @@ public final class DnsNameResolverBuilder {
 
     private DnsCache newCache() {
         return new DefaultDnsCache(intValue(minTtl, 0), intValue(maxTtl, Integer.MAX_VALUE), intValue(negativeTtl, 0));
+    }
+
+    private AuthoritativeDnsServerCache newAuthoritativeDnsServerCache() {
+        return new DefaultAuthoritativeDnsServerCache(
+                intValue(minTtl, 0), intValue(maxTtl, Integer.MAX_VALUE),
+                // Let us use the sane ordering as DnsNameResolver will be used when returning
+                // nameservers from the cache.
+                new NameServerComparator(DnsNameResolver.preferredAddressType(resolvedAddressTypes).addressType()));
+    }
+
+    private DnsCnameCache newCnameCache() {
+        return new DefaultDnsCnameCache(
+                intValue(minTtl, 0), intValue(maxTtl, Integer.MAX_VALUE));
     }
 
     /**
@@ -347,6 +456,10 @@ public final class DnsNameResolverBuilder {
      * @return a {@link DnsNameResolver}
      */
     public DnsNameResolver build() {
+        if (eventLoop == null) {
+            throw new IllegalStateException("eventLoop should be specified to build a DnsNameResolver.");
+        }
+
         if (resolveCache != null && (minTtl != null || maxTtl != null || negativeTtl != null)) {
             throw new IllegalStateException("resolveCache and TTLs are mutually exclusive");
         }
@@ -356,12 +469,15 @@ public final class DnsNameResolverBuilder {
         }
 
         DnsCache resolveCache = this.resolveCache != null ? this.resolveCache : newCache();
-        DnsCache authoritativeDnsServerCache = this.authoritativeDnsServerCache != null ?
-                this.authoritativeDnsServerCache : newCache();
+        DnsCnameCache cnameCache = this.cnameCache != null ? this.cnameCache : newCnameCache();
+        AuthoritativeDnsServerCache authoritativeDnsServerCache = this.authoritativeDnsServerCache != null ?
+                this.authoritativeDnsServerCache : newAuthoritativeDnsServerCache();
         return new DnsNameResolver(
                 eventLoop,
                 channelFactory,
+                socketChannelFactory,
                 resolveCache,
+                cnameCache,
                 authoritativeDnsServerCache,
                 dnsQueryLifecycleObserverFactory,
                 queryTimeoutMillis,
@@ -375,6 +491,74 @@ public final class DnsNameResolverBuilder {
                 dnsServerAddressStreamProvider,
                 searchDomains,
                 ndots,
-                decodeIdn);
+                decodeIdn,
+                completeOncePreferredResolved);
+    }
+
+    /**
+     * Creates a copy of this {@link DnsNameResolverBuilder}
+     *
+     * @return {@link DnsNameResolverBuilder}
+     */
+    public DnsNameResolverBuilder copy() {
+        DnsNameResolverBuilder copiedBuilder = new DnsNameResolverBuilder();
+
+        if (eventLoop != null) {
+            copiedBuilder.eventLoop(eventLoop);
+        }
+
+        if (channelFactory != null) {
+            copiedBuilder.channelFactory(channelFactory);
+        }
+
+        if (socketChannelFactory != null) {
+            copiedBuilder.socketChannelFactory(socketChannelFactory);
+        }
+
+        if (resolveCache != null) {
+            copiedBuilder.resolveCache(resolveCache);
+        }
+
+        if (cnameCache != null) {
+            copiedBuilder.cnameCache(cnameCache);
+        }
+        if (maxTtl != null && minTtl != null) {
+            copiedBuilder.ttl(minTtl, maxTtl);
+        }
+
+        if (negativeTtl != null) {
+            copiedBuilder.negativeTtl(negativeTtl);
+        }
+
+        if (authoritativeDnsServerCache != null) {
+            copiedBuilder.authoritativeDnsServerCache(authoritativeDnsServerCache);
+        }
+
+        if (dnsQueryLifecycleObserverFactory != null) {
+            copiedBuilder.dnsQueryLifecycleObserverFactory(dnsQueryLifecycleObserverFactory);
+        }
+
+        copiedBuilder.queryTimeoutMillis(queryTimeoutMillis);
+        copiedBuilder.resolvedAddressTypes(resolvedAddressTypes);
+        copiedBuilder.recursionDesired(recursionDesired);
+        copiedBuilder.maxQueriesPerResolve(maxQueriesPerResolve);
+        copiedBuilder.traceEnabled(traceEnabled);
+        copiedBuilder.maxPayloadSize(maxPayloadSize);
+        copiedBuilder.optResourceEnabled(optResourceEnabled);
+        copiedBuilder.hostsFileEntriesResolver(hostsFileEntriesResolver);
+
+        if (dnsServerAddressStreamProvider != null) {
+            copiedBuilder.nameServerProvider(dnsServerAddressStreamProvider);
+        }
+
+        if (searchDomains != null) {
+            copiedBuilder.searchDomains(Arrays.asList(searchDomains));
+        }
+
+        copiedBuilder.ndots(ndots);
+        copiedBuilder.decodeIdn(decodeIdn);
+        copiedBuilder.completeOncePreferredResolved(completeOncePreferredResolved);
+
+        return copiedBuilder;
     }
 }

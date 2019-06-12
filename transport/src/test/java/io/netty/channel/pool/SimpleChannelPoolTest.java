@@ -20,16 +20,14 @@ import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
+import io.netty.channel.DefaultEventLoopGroup;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.local.LocalAddress;
 import io.netty.channel.local.LocalChannel;
-import io.netty.channel.local.LocalEventLoopGroup;
 import io.netty.channel.local.LocalServerChannel;
 import io.netty.util.concurrent.Future;
 import org.hamcrest.CoreMatchers;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.ExpectedException;
 
 import java.util.Queue;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -39,12 +37,9 @@ import static org.junit.Assert.*;
 public class SimpleChannelPoolTest {
     private static final String LOCAL_ADDR_ID = "test.id";
 
-    @Rule
-    public ExpectedException expectedException = ExpectedException.none();
-
     @Test
     public void testAcquire() throws Exception {
-        EventLoopGroup group = new LocalEventLoopGroup();
+        EventLoopGroup group = new DefaultEventLoopGroup();
         LocalAddress addr = new LocalAddress(LOCAL_ADDR_ID);
         Bootstrap cb = new Bootstrap();
         cb.remoteAddress(addr);
@@ -85,7 +80,7 @@ public class SimpleChannelPoolTest {
             assertFalse(channel.isActive());
         }
 
-        assertEquals(1, handler.acquiredCount());
+        assertEquals(2, handler.acquiredCount());
         assertEquals(2, handler.releasedCount());
 
         sc.close().sync();
@@ -94,7 +89,7 @@ public class SimpleChannelPoolTest {
 
     @Test
     public void testBoundedChannelPoolSegment() throws Exception {
-        EventLoopGroup group = new LocalEventLoopGroup();
+        EventLoopGroup group = new DefaultEventLoopGroup();
         LocalAddress addr = new LocalAddress(LOCAL_ADDR_ID);
         Bootstrap cb = new Bootstrap();
         cb.remoteAddress(addr);
@@ -142,7 +137,7 @@ public class SimpleChannelPoolTest {
         channel2.close().sync();
 
         assertEquals(2, handler.channelCount());
-        assertEquals(0, handler.acquiredCount());
+        assertEquals(2, handler.acquiredCount());
         assertEquals(1, handler.releasedCount());
         sc.close().sync();
         channel.close().sync();
@@ -157,7 +152,7 @@ public class SimpleChannelPoolTest {
      */
     @Test
     public void testUnhealthyChannelIsNotOffered() throws Exception {
-        EventLoopGroup group = new LocalEventLoopGroup();
+        EventLoopGroup group = new DefaultEventLoopGroup();
         LocalAddress addr = new LocalAddress(LOCAL_ADDR_ID);
         Bootstrap cb = new Bootstrap();
         cb.remoteAddress(addr);
@@ -184,15 +179,15 @@ public class SimpleChannelPoolTest {
         //first check that when returned healthy then it actually offered back to the pool.
         assertSame(channel1, channel2);
 
-        expectedException.expect(IllegalStateException.class);
         channel1.close().syncUninterruptibly();
-        try {
-            pool.release(channel1).syncUninterruptibly();
-        } finally {
-            sc.close().syncUninterruptibly();
-            channel2.close().syncUninterruptibly();
-            group.shutdownGracefully();
-        }
+
+        pool.release(channel1).syncUninterruptibly();
+        Channel channel3 = pool.acquire().syncUninterruptibly().getNow();
+        //channel1 was not healthy anymore so it should not get acquired anymore.
+        assertNotSame(channel1, channel3);
+        sc.close().syncUninterruptibly();
+        channel3.close().syncUninterruptibly();
+        group.shutdownGracefully();
     }
 
     /**
@@ -203,7 +198,7 @@ public class SimpleChannelPoolTest {
      */
     @Test
     public void testUnhealthyChannelIsOfferedWhenNoHealthCheckRequested() throws Exception {
-        EventLoopGroup group = new LocalEventLoopGroup();
+        EventLoopGroup group = new DefaultEventLoopGroup();
         LocalAddress addr = new LocalAddress(LOCAL_ADDR_ID);
         Bootstrap cb = new Bootstrap();
         cb.remoteAddress(addr);

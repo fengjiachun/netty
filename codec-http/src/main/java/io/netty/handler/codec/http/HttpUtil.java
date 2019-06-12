@@ -15,32 +15,25 @@
  */
 package io.netty.handler.codec.http;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.util.AsciiString;
-import io.netty.util.CharsetUtil;
-
+import java.net.InetSocketAddress;
 import java.net.URI;
-import java.util.ArrayList;
 import java.nio.charset.Charset;
 import java.nio.charset.UnsupportedCharsetException;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+
+import io.netty.util.AsciiString;
+import io.netty.util.CharsetUtil;
+import io.netty.util.NetUtil;
 
 /**
  * Utility methods useful in the HTTP context.
  */
 public final class HttpUtil {
-    /**
-     * @deprecated Use {@link EmptyHttpHeaders#INSTANCE}
-     * <p>
-     * The instance is instantiated here to break the cyclic static initialization between {@link EmptyHttpHeaders} and
-     * {@link HttpHeaders}. The issue is that if someone accesses {@link EmptyHttpHeaders#INSTANCE} before
-     * {@link HttpHeaders#EMPTY_HEADERS} then {@link HttpHeaders#EMPTY_HEADERS} will be {@code null}.
-     */
-    @Deprecated
-    static final EmptyHttpHeaders EMPTY_HEADERS = new EmptyHttpHeaders();
+
     private static final AsciiString CHARSET_EQUALS = AsciiString.of(HttpHeaderValues.CHARSET + "=");
-    private static final AsciiString SEMICOLON = AsciiString.of(";");
+    private static final AsciiString SEMICOLON = AsciiString.cached(";");
 
     private HttpUtil() { }
 
@@ -67,20 +60,14 @@ public final class HttpUtil {
     /**
      * Returns {@code true} if and only if the connection can remain open and
      * thus 'kept alive'.  This methods respects the value of the.
+     *
      * {@code "Connection"} header first and then the return value of
      * {@link HttpVersion#isKeepAliveDefault()}.
      */
     public static boolean isKeepAlive(HttpMessage message) {
-        CharSequence connection = message.headers().get(HttpHeaderNames.CONNECTION);
-        if (connection != null && HttpHeaderValues.CLOSE.contentEqualsIgnoreCase(connection)) {
-            return false;
-        }
-
-        if (message.protocolVersion().isKeepAliveDefault()) {
-            return !HttpHeaderValues.CLOSE.contentEqualsIgnoreCase(connection);
-        } else {
-            return HttpHeaderValues.KEEP_ALIVE.contentEqualsIgnoreCase(connection);
-        }
+        return !message.headers().containsValue(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE, true) &&
+               (message.protocolVersion().isKeepAliveDefault() ||
+                message.headers().containsValue(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE, true));
     }
 
     /**
@@ -172,23 +159,19 @@ public final class HttpUtil {
     }
 
     /**
-     * Returns the length of the content. Please note that this value is
-     * not retrieved from {@link HttpContent#content()} but from the
-     * {@code "Content-Length"} header, and thus they are independent from each
-     * other.
+     * Returns the length of the content or the specified default value if the message does not have the {@code
+     * "Content-Length" header}. Please note that this value is not retrieved from {@link HttpContent#content()} but
+     * from the {@code "Content-Length"} header, and thus they are independent from each other.
      *
-     * @return the content length or {@code defaultValue} if this message does
-     *         not have the {@code "Content-Length"} header or its value is not
-     *         a number
+     * @param message      the message
+     * @param defaultValue the default value
+     * @return the content length or the specified default value
+     * @throws NumberFormatException if the {@code "Content-Length"} header does not parse as a long
      */
     public static long getContentLength(HttpMessage message, long defaultValue) {
         String value = message.headers().get(HttpHeaderNames.CONTENT_LENGTH);
         if (value != null) {
-            try {
-                return Long.parseLong(value);
-            } catch (NumberFormatException ignore) {
-                return defaultValue;
-            }
+            return Long.parseLong(value);
         }
 
         // We know the content length if it's a Web Socket message even if
@@ -204,6 +187,7 @@ public final class HttpUtil {
 
     /**
      * Get an {@code int} representation of {@link #getContentLength(HttpMessage, long)}.
+     *
      * @return the content length or {@code defaultValue} if this message does
      *         not have the {@code "Content-Length"} header or its value is not
      *         a number. Not to exceed the boundaries of integer.
@@ -260,13 +244,9 @@ public final class HttpUtil {
      * present
      */
     public static boolean is100ContinueExpected(HttpMessage message) {
-        if (!isExpectHeaderValid(message)) {
-            return false;
-        }
-
-        final String expectValue = message.headers().get(HttpHeaderNames.EXPECT);
-        // unquoted tokens in the expect header are case-insensitive, thus 100-continue is case insensitive
-        return HttpHeaderValues.CONTINUE.toString().equalsIgnoreCase(expectValue);
+        return isExpectHeaderValid(message)
+          // unquoted tokens in the expect header are case-insensitive, thus 100-continue is case insensitive
+          && message.headers().contains(HttpHeaderNames.EXPECT, HttpHeaderValues.CONTINUE, true);
     }
 
     /**
@@ -324,6 +304,7 @@ public final class HttpUtil {
     /**
      * Set the {@link HttpHeaderNames#TRANSFER_ENCODING} to either include {@link HttpHeaderValues#CHUNKED} if
      * {@code chunked} is {@code true}, or remove {@link HttpHeaderValues#CHUNKED} if {@code chunked} is {@code false}.
+     *
      * @param m The message which contains the headers to modify.
      * @param chunked if {@code true} then include {@link HttpHeaderValues#CHUNKED} in the headers. otherwise remove
      * {@link HttpHeaderValues#CHUNKED} from the headers.
@@ -357,7 +338,7 @@ public final class HttpUtil {
      * Fetch charset from message's Content-Type header.
      *
      * @param message entity to fetch Content-Type header from
-     * @return the charset from message's Content-Type header or {@link io.netty.util.CharsetUtil#ISO_8859_1}
+     * @return the charset from message's Content-Type header or {@link CharsetUtil#ISO_8859_1}
      * if charset is not presented or unparsable
      */
     public static Charset getCharset(HttpMessage message) {
@@ -368,7 +349,7 @@ public final class HttpUtil {
      * Fetch charset from Content-Type header value.
      *
      * @param contentTypeValue Content-Type header value to parse
-     * @return the charset from message's Content-Type header or {@link io.netty.util.CharsetUtil#ISO_8859_1}
+     * @return the charset from message's Content-Type header or {@link CharsetUtil#ISO_8859_1}
      * if charset is not presented or unparsable
      */
     public static Charset getCharset(CharSequence contentTypeValue) {
@@ -382,8 +363,8 @@ public final class HttpUtil {
     /**
      * Fetch charset from message's Content-Type header.
      *
-     * @param message entity to fetch Content-Type header from
-     * @param defaultCharset result to use in case of empty, incorrect or doesn't conain required part header value
+     * @param message        entity to fetch Content-Type header from
+     * @param defaultCharset result to use in case of empty, incorrect or doesn't contain required part header value
      * @return the charset from message's Content-Type header or {@code defaultCharset}
      * if charset is not presented or unparsable
      */
@@ -400,7 +381,7 @@ public final class HttpUtil {
      * Fetch charset from Content-Type header value.
      *
      * @param contentTypeValue Content-Type header value to parse
-     * @param defaultCharset result to use in case of empty, incorrect or doesn't contain required part header value
+     * @param defaultCharset   result to use in case of empty, incorrect or doesn't contain required part header value
      * @return the charset from message's Content-Type header or {@code defaultCharset}
      * if charset is not presented or unparsable
      */
@@ -410,7 +391,7 @@ public final class HttpUtil {
             if (charsetCharSequence != null) {
                 try {
                     return Charset.forName(charsetCharSequence.toString());
-                } catch (UnsupportedCharsetException unsupportedException) {
+                } catch (UnsupportedCharsetException ignored) {
                     return defaultCharset;
                 }
             } else {
@@ -470,13 +451,23 @@ public final class HttpUtil {
         if (contentTypeValue == null) {
             throw new NullPointerException("contentTypeValue");
         }
+
         int indexOfCharset = AsciiString.indexOfIgnoreCaseAscii(contentTypeValue, CHARSET_EQUALS, 0);
-        if (indexOfCharset != AsciiString.INDEX_NOT_FOUND) {
-            int indexOfEncoding = indexOfCharset + CHARSET_EQUALS.length();
-            if (indexOfEncoding < contentTypeValue.length()) {
-                return contentTypeValue.subSequence(indexOfEncoding, contentTypeValue.length());
-            }
+        if (indexOfCharset == AsciiString.INDEX_NOT_FOUND) {
+            return null;
         }
+
+        int indexOfEncoding = indexOfCharset + CHARSET_EQUALS.length();
+        if (indexOfEncoding < contentTypeValue.length()) {
+            CharSequence charsetCandidate = contentTypeValue.subSequence(indexOfEncoding, contentTypeValue.length());
+            int indexOfSemicolon = AsciiString.indexOfIgnoreCaseAscii(charsetCandidate, SEMICOLON, 0);
+            if (indexOfSemicolon == AsciiString.INDEX_NOT_FOUND) {
+                return charsetCandidate;
+            }
+
+            return charsetCandidate.subSequence(0, indexOfSemicolon);
+        }
+
         return null;
     }
 
@@ -525,14 +516,21 @@ public final class HttpUtil {
         }
     }
 
-    static void encodeAscii0(CharSequence seq, ByteBuf buf) {
-        int length = seq.length();
-        for (int i = 0 ; i < length; i++) {
-            buf.writeByte(c2b(seq.charAt(i)));
+    /**
+     * Formats the host string of an address so it can be used for computing an HTTP component
+     * such as an URL or a Host header
+     *
+     * @param addr the address
+     * @return the formatted String
+     */
+    public static String formatHostnameForHttp(InetSocketAddress addr) {
+        String hostString = NetUtil.getHostname(addr);
+        if (NetUtil.isValidIpV6Address(hostString)) {
+            if (!addr.isUnresolved()) {
+                hostString = NetUtil.toAddressString(addr.getAddress());
+            }
+            return '[' + hostString + ']';
         }
-    }
-
-    private static byte c2b(char c) {
-        return c > 255 ? (byte) '?' : (byte) c;
+        return hostString;
     }
 }

@@ -27,7 +27,6 @@ import io.netty.channel.ChannelInitializer;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.handler.ssl.JdkSslClientContext;
-import io.netty.handler.ssl.JdkSslContext;
 import io.netty.handler.ssl.JdkSslServerContext;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
@@ -99,7 +98,7 @@ public class SocketSslSessionReuseTest extends AbstractSocketTest {
     public void testSslSessionReuse(ServerBootstrap sb, Bootstrap cb) throws Throwable {
         final ReadAndDiscardHandler sh = new ReadAndDiscardHandler(true, true);
         final ReadAndDiscardHandler ch = new ReadAndDiscardHandler(false, true);
-        final String[] protocols = new String[]{ "TLSv1", "TLSv1.1", "TLSv1.2" };
+        final String[] protocols = { "TLSv1", "TLSv1.1", "TLSv1.2" };
 
         sb.childHandler(new ChannelInitializer<SocketChannel>() {
             @Override
@@ -128,16 +127,16 @@ public class SocketSslSessionReuseTest extends AbstractSocketTest {
         });
 
         try {
-            SSLSessionContext clientSessionCtx = ((JdkSslContext) clientCtx).sessionContext();
+            SSLSessionContext clientSessionCtx = clientCtx.sessionContext();
             ByteBuf msg = Unpooled.wrappedBuffer(new byte[] { 0xa, 0xb, 0xc, 0xd }, 0, 4);
-            Channel cc = cb.connect().sync().channel();
+            Channel cc = cb.connect(sc.localAddress()).sync().channel();
             cc.writeAndFlush(msg).sync();
             cc.closeFuture().sync();
             rethrowHandlerExceptions(sh, ch);
             Set<String> sessions = sessionIdSet(clientSessionCtx.getIds());
 
             msg = Unpooled.wrappedBuffer(new byte[] { 0xa, 0xb, 0xc, 0xd }, 0, 4);
-            cc = cb.connect().sync().channel();
+            cc = cb.connect(sc.localAddress()).sync().channel();
             cc.writeAndFlush(msg).sync();
             cc.closeFuture().sync();
             assertEquals("Expected no new sessions", sessions, sessionIdSet(clientSessionCtx.getIds()));

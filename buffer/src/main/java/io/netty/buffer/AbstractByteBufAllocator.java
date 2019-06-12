@@ -16,6 +16,8 @@
 
 package io.netty.buffer;
 
+import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
+
 import io.netty.util.ResourceLeakDetector;
 import io.netty.util.ResourceLeakTracker;
 import io.netty.util.internal.PlatformDependent;
@@ -29,6 +31,10 @@ public abstract class AbstractByteBufAllocator implements ByteBufAllocator {
     static final int DEFAULT_MAX_CAPACITY = Integer.MAX_VALUE;
     static final int DEFAULT_MAX_COMPONENTS = 16;
     static final int CALCULATE_THRESHOLD = 1048576 * 4; // 4 MiB page
+
+    static {
+        ResourceLeakDetector.addExclusions(AbstractByteBufAllocator.class, "toLeakAwareBuffer");
+    }
 
     protected static ByteBuf toLeakAwareBuffer(ByteBuf buf) {
         ResourceLeakTracker<ByteBuf> leak;
@@ -121,7 +127,7 @@ public abstract class AbstractByteBufAllocator implements ByteBufAllocator {
 
     @Override
     public ByteBuf ioBuffer() {
-        if (PlatformDependent.hasUnsafe()) {
+        if (PlatformDependent.hasUnsafe() || isDirectBufferPooled()) {
             return directBuffer(DEFAULT_INITIAL_CAPACITY);
         }
         return heapBuffer(DEFAULT_INITIAL_CAPACITY);
@@ -129,7 +135,7 @@ public abstract class AbstractByteBufAllocator implements ByteBufAllocator {
 
     @Override
     public ByteBuf ioBuffer(int initialCapacity) {
-        if (PlatformDependent.hasUnsafe()) {
+        if (PlatformDependent.hasUnsafe() || isDirectBufferPooled()) {
             return directBuffer(initialCapacity);
         }
         return heapBuffer(initialCapacity);
@@ -137,7 +143,7 @@ public abstract class AbstractByteBufAllocator implements ByteBufAllocator {
 
     @Override
     public ByteBuf ioBuffer(int initialCapacity, int maxCapacity) {
-        if (PlatformDependent.hasUnsafe()) {
+        if (PlatformDependent.hasUnsafe() || isDirectBufferPooled()) {
             return directBuffer(initialCapacity, maxCapacity);
         }
         return heapBuffer(initialCapacity, maxCapacity);
@@ -218,9 +224,7 @@ public abstract class AbstractByteBufAllocator implements ByteBufAllocator {
     }
 
     private static void validate(int initialCapacity, int maxCapacity) {
-        if (initialCapacity < 0) {
-            throw new IllegalArgumentException("initialCapacity: " + initialCapacity + " (expected: 0+)");
-        }
+        checkPositiveOrZero(initialCapacity, "initialCapacity");
         if (initialCapacity > maxCapacity) {
             throw new IllegalArgumentException(String.format(
                     "initialCapacity: %d (expected: not greater than maxCapacity(%d)",
@@ -245,9 +249,7 @@ public abstract class AbstractByteBufAllocator implements ByteBufAllocator {
 
     @Override
     public int calculateNewCapacity(int minNewCapacity, int maxCapacity) {
-        if (minNewCapacity < 0) {
-            throw new IllegalArgumentException("minNewCapacity: " + minNewCapacity + " (expected: 0+)");
-        }
+        checkPositiveOrZero(minNewCapacity, "minNewCapacity");
         if (minNewCapacity > maxCapacity) {
             throw new IllegalArgumentException(String.format(
                     "minNewCapacity: %d (expected: not greater than maxCapacity(%d)",

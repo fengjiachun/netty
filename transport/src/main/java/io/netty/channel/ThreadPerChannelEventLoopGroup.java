@@ -42,7 +42,10 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * An {@link EventLoopGroup} that creates one {@link EventLoop} per {@link Channel}.
+ *
+ * @deprecated this will be remove in the next-major release.
  */
+@Deprecated
 public class ThreadPerChannelEventLoopGroup extends AbstractEventExecutorGroup implements EventLoopGroup {
 
     private final Object[] childArgs;
@@ -132,7 +135,7 @@ public class ThreadPerChannelEventLoopGroup extends AbstractEventExecutorGroup i
         this.executor = executor;
 
         tooManyChannels = ThrowableUtil.unknownStackTrace(
-                new ChannelException("too many channels (max: " + maxChannels + ')'),
+                ChannelException.newStatic("too many channels (max: " + maxChannels + ')', null),
                 ThreadPerChannelEventLoopGroup.class, "nextChild()");
     }
 

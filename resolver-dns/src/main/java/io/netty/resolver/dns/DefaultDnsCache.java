@@ -17,16 +17,13 @@ package io.netty.resolver.dns;
 
 import io.netty.channel.EventLoop;
 import io.netty.handler.codec.dns.DnsRecord;
-import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.UnstableApi;
 
 import java.net.InetAddress;
-import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.TimeUnit;
 
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
 import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
@@ -38,7 +35,25 @@ import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
 @UnstableApi
 public class DefaultDnsCache implements DnsCache {
 
-    private final ConcurrentMap<String, List<DnsCacheEntry>> resolveCache = PlatformDependent.newConcurrentHashMap();
+    private final Cache<DefaultDnsCacheEntry> resolveCache = new Cache<DefaultDnsCacheEntry>() {
+
+        @Override
+        protected boolean shouldReplaceAll(DefaultDnsCacheEntry entry) {
+            return entry.cause() != null;
+        }
+
+        @Override
+        protected boolean equals(DefaultDnsCacheEntry entry, DefaultDnsCacheEntry otherEntry) {
+            if (entry.address() != null) {
+                return entry.address().equals(otherEntry.address());
+            }
+            if (otherEntry.address() != null) {
+                return false;
+            }
+            return entry.cause().equals(otherEntry.cause());
+        }
+    };
+
     private final int minTtl;
     private final int maxTtl;
     private final int negativeTtl;
@@ -48,7 +63,7 @@ public class DefaultDnsCache implements DnsCache {
      * and doesn't cache negative responses.
      */
     public DefaultDnsCache() {
-        this(0, Integer.MAX_VALUE, 0);
+        this(0, Cache.MAX_SUPPORTED_TTL_SECS, 0);
     }
 
     /**
@@ -58,8 +73,8 @@ public class DefaultDnsCache implements DnsCache {
      * @param negativeTtl the TTL for failed queries
      */
     public DefaultDnsCache(int minTtl, int maxTtl, int negativeTtl) {
-        this.minTtl = checkPositiveOrZero(minTtl, "minTtl");
-        this.maxTtl = checkPositiveOrZero(maxTtl, "maxTtl");
+        this.minTtl = Math.min(Cache.MAX_SUPPORTED_TTL_SECS, checkPositiveOrZero(minTtl, "minTtl"));
+        this.maxTtl = Math.min(Cache.MAX_SUPPORTED_TTL_SECS, checkPositiveOrZero(maxTtl, "maxTtl"));
         if (minTtl > maxTtl) {
             throw new IllegalArgumentException(
                     "minTtl: " + minTtl + ", maxTtl: " + maxTtl + " (expected: 0 <= minTtl <= maxTtl)");
@@ -95,26 +110,13 @@ public class DefaultDnsCache implements DnsCache {
 
     @Override
     public void clear() {
-        for (Iterator<Map.Entry<String, List<DnsCacheEntry>>> i = resolveCache.entrySet().iterator(); i.hasNext();) {
-            final Map.Entry<String, List<DnsCacheEntry>> e = i.next();
-            i.remove();
-            cancelExpiration(e.getValue());
-        }
+        resolveCache.clear();
     }
 
     @Override
     public boolean clear(String hostname) {
         checkNotNull(hostname, "hostname");
-        boolean removed = false;
-        for (Iterator<Map.Entry<String, List<DnsCacheEntry>>> i = resolveCache.entrySet().iterator(); i.hasNext();) {
-            final Map.Entry<String, List<DnsCacheEntry>> e = i.next();
-            if (e.getKey().equals(hostname)) {
-                i.remove();
-                cancelExpiration(e.getValue());
-                removed = true;
-            }
-        }
-        return removed;
+        return resolveCache.clear(appendDot(hostname));
     }
 
     private static boolean emptyAdditionals(DnsRecord[] additionals) {
@@ -122,101 +124,42 @@ public class DefaultDnsCache implements DnsCache {
     }
 
     @Override
-    public List<DnsCacheEntry> get(String hostname, DnsRecord[] additionals) {
+    public List<? extends DnsCacheEntry> get(String hostname, DnsRecord[] additionals) {
         checkNotNull(hostname, "hostname");
         if (!emptyAdditionals(additionals)) {
-            return null;
+            return Collections.<DnsCacheEntry>emptyList();
         }
-        return resolveCache.get(hostname);
-    }
 
-    private List<DnsCacheEntry> cachedEntries(String hostname) {
-        List<DnsCacheEntry> oldEntries = resolveCache.get(hostname);
-        final List<DnsCacheEntry> entries;
-        if (oldEntries == null) {
-            List<DnsCacheEntry> newEntries = new ArrayList<DnsCacheEntry>(8);
-            oldEntries = resolveCache.putIfAbsent(hostname, newEntries);
-            entries = oldEntries != null? oldEntries : newEntries;
-        } else {
-            entries = oldEntries;
-        }
-        return entries;
+        return resolveCache.get(appendDot(hostname));
     }
 
     @Override
-    public void cache(String hostname, DnsRecord[] additionals,
-                      InetAddress address, long originalTtl, EventLoop loop) {
+    public DnsCacheEntry cache(String hostname, DnsRecord[] additionals,
+                               InetAddress address, long originalTtl, EventLoop loop) {
         checkNotNull(hostname, "hostname");
         checkNotNull(address, "address");
         checkNotNull(loop, "loop");
+        DefaultDnsCacheEntry e = new DefaultDnsCacheEntry(hostname, address);
         if (maxTtl == 0 || !emptyAdditionals(additionals)) {
-            return;
+            return e;
         }
-        final int ttl = Math.max(minTtl, (int) Math.min(maxTtl, originalTtl));
-        final List<DnsCacheEntry> entries = cachedEntries(hostname);
-        final DnsCacheEntry e = new DnsCacheEntry(hostname, address);
-
-        synchronized (entries) {
-            if (!entries.isEmpty()) {
-                final DnsCacheEntry firstEntry = entries.get(0);
-                if (firstEntry.cause() != null) {
-                    assert entries.size() == 1;
-                    firstEntry.cancelExpiration();
-                    entries.clear();
-                }
-            }
-            entries.add(e);
-        }
-
-        scheduleCacheExpiration(entries, e, ttl, loop);
+        resolveCache.cache(appendDot(hostname), e, Math.max(minTtl, (int) Math.min(maxTtl, originalTtl)), loop);
+        return e;
     }
 
     @Override
-    public void cache(String hostname, DnsRecord[] additionals, Throwable cause, EventLoop loop) {
+    public DnsCacheEntry cache(String hostname, DnsRecord[] additionals, Throwable cause, EventLoop loop) {
         checkNotNull(hostname, "hostname");
         checkNotNull(cause, "cause");
         checkNotNull(loop, "loop");
 
+        DefaultDnsCacheEntry e = new DefaultDnsCacheEntry(hostname, cause);
         if (negativeTtl == 0 || !emptyAdditionals(additionals)) {
-            return;
-        }
-        final List<DnsCacheEntry> entries = cachedEntries(hostname);
-        final DnsCacheEntry e = new DnsCacheEntry(hostname, cause);
-
-        synchronized (entries) {
-            final int numEntries = entries.size();
-            for (int i = 0; i < numEntries; i ++) {
-                entries.get(i).cancelExpiration();
-            }
-            entries.clear();
-            entries.add(e);
+            return e;
         }
 
-        scheduleCacheExpiration(entries, e, negativeTtl, loop);
-    }
-
-    private static void cancelExpiration(List<DnsCacheEntry> entries) {
-        final int numEntries = entries.size();
-        for (int i = 0; i < numEntries; i++) {
-            entries.get(i).cancelExpiration();
-        }
-    }
-
-    private void scheduleCacheExpiration(final List<DnsCacheEntry> entries,
-                                         final DnsCacheEntry e,
-                                         int ttl,
-                                         EventLoop loop) {
-        e.scheduleExpiration(loop, new Runnable() {
-                    @Override
-                    public void run() {
-                        synchronized (entries) {
-                            entries.remove(e);
-                            if (entries.isEmpty()) {
-                                resolveCache.remove(e.hostname());
-                            }
-                        }
-                    }
-                }, ttl, TimeUnit.SECONDS);
+        resolveCache.cache(appendDot(hostname), e, negativeTtl, loop);
+        return e;
     }
 
     @Override
@@ -226,7 +169,52 @@ public class DefaultDnsCache implements DnsCache {
                 .append(minTtl).append(", maxTtl=")
                 .append(maxTtl).append(", negativeTtl=")
                 .append(negativeTtl).append(", cached resolved hostname=")
-                .append(resolveCache.size()).append(")")
+                .append(resolveCache.size()).append(')')
                 .toString();
+    }
+
+    private static final class DefaultDnsCacheEntry implements DnsCacheEntry {
+        private final String hostname;
+        private final InetAddress address;
+        private final Throwable cause;
+
+        DefaultDnsCacheEntry(String hostname, InetAddress address) {
+            this.hostname = hostname;
+            this.address = address;
+            cause = null;
+        }
+
+        DefaultDnsCacheEntry(String hostname, Throwable cause) {
+            this.hostname = hostname;
+            this.cause = cause;
+            address = null;
+        }
+
+        @Override
+        public InetAddress address() {
+            return address;
+        }
+
+        @Override
+        public Throwable cause() {
+            return cause;
+        }
+
+        String hostname() {
+            return hostname;
+        }
+
+        @Override
+        public String toString() {
+            if (cause != null) {
+                return hostname + '/' + cause;
+            } else {
+                return address.toString();
+            }
+        }
+    }
+
+    private static String appendDot(String hostname) {
+        return StringUtil.endsWith(hostname, '.') ? hostname : hostname + '.';
     }
 }

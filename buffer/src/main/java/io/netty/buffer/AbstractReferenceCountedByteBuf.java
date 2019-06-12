@@ -16,62 +16,73 @@
 
 package io.netty.buffer;
 
-import io.netty.util.IllegalReferenceCountException;
-
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
-import static io.netty.util.internal.ObjectUtil.checkPositive;
+import io.netty.util.internal.ReferenceCountUpdater;
 
 /**
  * Abstract base class for {@link ByteBuf} implementations that count references.
  */
 public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
-
-    private static final AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> refCntUpdater =
+    private static final long REFCNT_FIELD_OFFSET =
+            ReferenceCountUpdater.getUnsafeOffset(AbstractReferenceCountedByteBuf.class, "refCnt");
+    private static final AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> AIF_UPDATER =
             AtomicIntegerFieldUpdater.newUpdater(AbstractReferenceCountedByteBuf.class, "refCnt");
 
-    private volatile int refCnt = 1;
+    private static final ReferenceCountUpdater<AbstractReferenceCountedByteBuf> updater =
+            new ReferenceCountUpdater<AbstractReferenceCountedByteBuf>() {
+        @Override
+        protected AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> updater() {
+            return AIF_UPDATER;
+        }
+        @Override
+        protected long unsafeOffset() {
+            return REFCNT_FIELD_OFFSET;
+        }
+    };
+
+    // Value might not equal "real" reference count, all access should be via the updater
+    @SuppressWarnings("unused")
+    private volatile int refCnt = updater.initialValue();
 
     protected AbstractReferenceCountedByteBuf(int maxCapacity) {
         super(maxCapacity);
     }
 
     @Override
+    boolean isAccessible() {
+        // Try to do non-volatile read for performance as the ensureAccessible() is racy anyway and only provide
+        // a best-effort guard.
+        return updater.isLiveNonVolatile(this);
+    }
+
+    @Override
     public int refCnt() {
-        return refCnt;
+        return updater.refCnt(this);
     }
 
     /**
      * An unsafe operation intended for use by a subclass that sets the reference count of the buffer directly
      */
     protected final void setRefCnt(int refCnt) {
-        this.refCnt = refCnt;
+        updater.setRefCnt(this, refCnt);
+    }
+
+    /**
+     * An unsafe operation intended for use by a subclass that resets the reference count of the buffer to 1
+     */
+    protected final void resetRefCnt() {
+        updater.resetRefCnt(this);
     }
 
     @Override
     public ByteBuf retain() {
-        return retain0(1);
+        return updater.retain(this);
     }
 
     @Override
     public ByteBuf retain(int increment) {
-        return retain0(checkPositive(increment, "increment"));
-    }
-
-    private ByteBuf retain0(int increment) {
-        for (;;) {
-            int refCnt = this.refCnt;
-            final int nextCnt = refCnt + increment;
-
-            // Ensure we not resurrect (which means the refCnt was 0) and also that we encountered an overflow.
-            if (nextCnt <= increment) {
-                throw new IllegalReferenceCountException(refCnt, increment);
-            }
-            if (refCntUpdater.compareAndSet(this, refCnt, nextCnt)) {
-                break;
-            }
-        }
-        return this;
+        return updater.retain(this, increment);
     }
 
     @Override
@@ -86,30 +97,21 @@ public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
 
     @Override
     public boolean release() {
-        return release0(1);
+        return handleRelease(updater.release(this));
     }
 
     @Override
     public boolean release(int decrement) {
-        return release0(checkPositive(decrement, "decrement"));
+        return handleRelease(updater.release(this, decrement));
     }
 
-    private boolean release0(int decrement) {
-        for (;;) {
-            int refCnt = this.refCnt;
-            if (refCnt < decrement) {
-                throw new IllegalReferenceCountException(refCnt, -decrement);
-            }
-
-            if (refCntUpdater.compareAndSet(this, refCnt, refCnt - decrement)) {
-                if (refCnt == decrement) {
-                    deallocate();
-                    return true;
-                }
-                return false;
-            }
+    private boolean handleRelease(boolean result) {
+        if (result) {
+            deallocate();
         }
+        return result;
     }
+
     /**
      * Called once {@link #refCnt()} is equals 0.
      */

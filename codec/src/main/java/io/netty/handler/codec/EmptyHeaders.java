@@ -30,7 +30,7 @@ public class EmptyHeaders<K, V, T extends Headers<K, V, T>> implements Headers<K
 
     @Override
     public V get(K name, V defaultValue) {
-        return null;
+        return defaultValue;
     }
 
     @Override
@@ -40,7 +40,7 @@ public class EmptyHeaders<K, V, T extends Headers<K, V, T>> implements Headers<K
 
     @Override
     public V getAndRemove(K name, V defaultValue) {
-        return null;
+        return defaultValue;
     }
 
     @Override
@@ -481,6 +481,16 @@ public class EmptyHeaders<K, V, T extends Headers<K, V, T>> implements Headers<K
     @Override
     public T clear() {
         return thisT();
+    }
+
+    /**
+     * Equivalent to {@link #getAll(Object)} but no intermediate list is generated.
+     * @param name the name of the header to retrieve
+     * @return an {@link Iterator} of header values corresponding to {@code name}.
+     */
+    public Iterator<V> valueIterator(@SuppressWarnings("unused") K name) {
+        List<V> empty = Collections.emptyList();
+        return empty.iterator();
     }
 
     @Override

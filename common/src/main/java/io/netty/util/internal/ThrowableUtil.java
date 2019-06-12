@@ -18,6 +18,7 @@ package io.netty.util.internal;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.util.List;
 
 public final class ThrowableUtil {
 
@@ -50,6 +51,29 @@ public final class ThrowableUtil {
             } catch (IOException ignore) {
                 // ignore as should never happen
             }
+        }
+    }
+
+    public static boolean haveSuppressed() {
+        return PlatformDependent.javaVersion() >= 7;
+    }
+
+    @SuppressJava6Requirement(reason = "Throwable addSuppressed is only available for >= 7. Has check for < 7.")
+    public static void addSuppressed(Throwable target, Throwable suppressed) {
+        if (!haveSuppressed()) {
+            return;
+        }
+        target.addSuppressed(suppressed);
+    }
+
+    public static void addSuppressedAndClear(Throwable target, List<Throwable> suppressed) {
+        addSuppressed(target, suppressed);
+        suppressed.clear();
+    }
+
+    public static void addSuppressed(Throwable target, List<Throwable> suppressed) {
+        for (Throwable t : suppressed) {
+            addSuppressed(target, t);
         }
     }
 }

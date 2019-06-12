@@ -23,7 +23,7 @@ import static io.netty.util.internal.ObjectUtil.checkNotNull;
 
 import io.netty.handler.codec.DateFormatter;
 import io.netty.handler.codec.http.HttpConstants;
-import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpResponse;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -40,12 +40,12 @@ import java.util.Map;
  *
  * As Netty's Cookie merges Expires and MaxAge into one single field, only Max-Age field is sent.
  *
- * Note that multiple cookies are supposed to be sent at once in a single "Set-Cookie" header.
+ * Note that multiple cookies must be sent as separate "Set-Cookie" headers.
  *
  * <pre>
  * // Example
- * {@link HttpRequest} req = ...;
- * res.setHeader("Cookie", {@link ServerCookieEncoder}.encode("JSESSIONID", "1234"));
+ * {@link HttpResponse} res = ...;
+ * res.setHeader("Set-Cookie", {@link ServerCookieEncoder}.encode("JSESSIONID", "1234"));
  * </pre>
  *
  * @see ServerCookieDecoder
@@ -105,10 +105,10 @@ public final class ServerCookieEncoder extends CookieEncoder {
             add(buf, CookieHeaderNames.MAX_AGE, cookie.maxAge());
             Date expires = new Date(cookie.maxAge() * 1000 + System.currentTimeMillis());
             buf.append(CookieHeaderNames.EXPIRES);
-            buf.append((char) HttpConstants.EQUALS);
+            buf.append('=');
             DateFormatter.append(expires, buf);
-            buf.append((char) HttpConstants.SEMICOLON);
-            buf.append((char) HttpConstants.SP);
+            buf.append(';');
+            buf.append(HttpConstants.SP_CHAR);
         }
 
         if (cookie.path() != null) {

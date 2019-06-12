@@ -17,6 +17,7 @@ package io.netty.handler.codec.http2;
 
 import io.netty.handler.codec.Headers;
 import io.netty.util.AsciiString;
+import io.netty.util.HashingStrategy;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -27,9 +28,10 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
 
-import static io.netty.handler.codec.CharSequenceValueConverter.INSTANCE;
-import static io.netty.handler.codec.http2.DefaultHttp2Headers.HTTP2_NAME_VALIDATOR;
-import static io.netty.util.internal.EmptyArrays.EMPTY_ASCII_STRINGS;
+import static io.netty.handler.codec.CharSequenceValueConverter.*;
+import static io.netty.handler.codec.http2.DefaultHttp2Headers.*;
+import static io.netty.util.AsciiString.*;
+import static io.netty.util.internal.EmptyArrays.*;
 
 /**
  * A variant of {@link Http2Headers} which only supports read-only methods.
@@ -428,29 +430,7 @@ public final class ReadOnlyHttp2Headers implements Http2Headers {
 
     @Override
     public boolean contains(CharSequence name, CharSequence value) {
-        final int nameHash = AsciiString.hashCode(name);
-        final int valueHash = AsciiString.hashCode(value);
-
-        final int pseudoHeadersEnd = pseudoHeaders.length - 1;
-        for (int i = 0; i < pseudoHeadersEnd; i += 2) {
-            AsciiString roName = pseudoHeaders[i];
-            AsciiString roValue = pseudoHeaders[i + 1];
-            if (roName.hashCode() == nameHash && roValue.hashCode() == valueHash &&
-                roName.contentEqualsIgnoreCase(name) && roValue.contentEqualsIgnoreCase(value)) {
-                return true;
-            }
-        }
-
-        final int otherHeadersEnd = otherHeaders.length - 1;
-        for (int i = 0; i < otherHeadersEnd; i += 2) {
-            AsciiString roName = otherHeaders[i];
-            AsciiString roValue = otherHeaders[i + 1];
-            if (roName.hashCode() == nameHash && roValue.hashCode() == valueHash &&
-                roName.contentEqualsIgnoreCase(name) && roValue.contentEqualsIgnoreCase(value)) {
-                return true;
-            }
-        }
-        return false;
+        return contains(name, value, false);
     }
 
     @Override
@@ -715,6 +695,11 @@ public final class ReadOnlyHttp2Headers implements Http2Headers {
     }
 
     @Override
+    public Iterator<CharSequence> valueIterator(CharSequence name) {
+        return new ReadOnlyValueIterator(name);
+    }
+
+    @Override
     public Http2Headers method(CharSequence value) {
         throw new UnsupportedOperationException("read only");
     }
@@ -765,6 +750,31 @@ public final class ReadOnlyHttp2Headers implements Http2Headers {
     }
 
     @Override
+    public boolean contains(CharSequence name, CharSequence value, boolean caseInsensitive) {
+        final int nameHash = AsciiString.hashCode(name);
+        final HashingStrategy<CharSequence> strategy =
+                caseInsensitive ? CASE_INSENSITIVE_HASHER : CASE_SENSITIVE_HASHER;
+        final int valueHash = strategy.hashCode(value);
+
+        return contains(name, nameHash, value, valueHash, strategy, otherHeaders)
+                || contains(name, nameHash, value, valueHash, strategy, pseudoHeaders);
+    }
+
+    private static boolean contains(CharSequence name, int nameHash, CharSequence value, int valueHash,
+                                    HashingStrategy<CharSequence> hashingStrategy, AsciiString[] headers) {
+        final int headersEnd = headers.length - 1;
+        for (int i = 0; i < headersEnd; i += 2) {
+            AsciiString roName = headers[i];
+            AsciiString roValue = headers[i + 1];
+            if (roName.hashCode() == nameHash && roValue.hashCode() == valueHash &&
+                roName.contentEqualsIgnoreCase(name) && hashingStrategy.equals(roValue, value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
     public String toString() {
         StringBuilder builder = new StringBuilder(getClass().getSimpleName()).append('[');
         String separator = "";
@@ -774,6 +784,58 @@ public final class ReadOnlyHttp2Headers implements Http2Headers {
             separator = ", ";
         }
         return builder.append(']').toString();
+    }
+
+    private final class ReadOnlyValueIterator implements Iterator<CharSequence> {
+        private int i;
+        private final int nameHash;
+        private final CharSequence name;
+        private AsciiString[] current = pseudoHeaders.length != 0 ? pseudoHeaders : otherHeaders;
+        private AsciiString next;
+
+        ReadOnlyValueIterator(CharSequence name) {
+            nameHash = AsciiString.hashCode(name);
+            this.name = name;
+            calculateNext();
+        }
+
+        @Override
+        public boolean hasNext() {
+            return next != null;
+        }
+
+        @Override
+        public CharSequence next() {
+            if (!hasNext()) {
+                throw new NoSuchElementException();
+            }
+            CharSequence current = next;
+            calculateNext();
+            return current;
+        }
+
+        @Override
+        public void remove() {
+            throw new UnsupportedOperationException("read only");
+        }
+
+        private void calculateNext() {
+            for (; i < current.length; i += 2) {
+                AsciiString roName = current[i];
+                if (roName.hashCode() == nameHash && roName.contentEqualsIgnoreCase(name)) {
+                    next = current[i + 1];
+                    i += 2;
+                    return;
+                }
+            }
+            if (i >= current.length && current == pseudoHeaders) {
+                i = 0;
+                current = otherHeaders;
+                calculateNext();
+            } else {
+                next = null;
+            }
+        }
     }
 
     private final class ReadOnlyIterator implements Map.Entry<CharSequence, CharSequence>,

@@ -21,6 +21,9 @@ import io.netty.handler.ssl.ApplicationProtocolConfig.SelectedListenerFailureBeh
 import io.netty.handler.ssl.ApplicationProtocolConfig.SelectorFailureBehavior;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
+import io.netty.internal.tcnative.SSL;
+import io.netty.util.CharsetUtil;
+import io.netty.util.internal.EmptyArrays;
 import io.netty.util.internal.PlatformDependent;
 import org.junit.Assume;
 import org.junit.BeforeClass;
@@ -43,9 +46,12 @@ import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLParameters;
 
 import static io.netty.handler.ssl.OpenSslTestUtils.checkShouldUseKeyManagerFactory;
-import static io.netty.handler.ssl.ReferenceCountedOpenSslEngine.MAX_ENCRYPTED_PACKET_LENGTH;
-import static io.netty.handler.ssl.ReferenceCountedOpenSslEngine.MAX_TLS_RECORD_OVERHEAD_LENGTH;
 import static io.netty.handler.ssl.ReferenceCountedOpenSslEngine.MAX_PLAINTEXT_LENGTH;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_SSL_V2_HELLO;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_SSL_V3;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_TLS_V1;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_TLS_V1_1;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_TLS_V1_2;
 import static io.netty.internal.tcnative.SSL.SSL_CVERIFY_IGNORED;
 import static java.lang.Integer.MAX_VALUE;
 import static org.junit.Assert.assertEquals;
@@ -55,27 +61,54 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 
+
 @RunWith(Parameterized.class)
 public class OpenSslEngineTest extends SSLEngineTest {
     private static final String PREFERRED_APPLICATION_LEVEL_PROTOCOL = "my-protocol-http2";
     private static final String FALLBACK_APPLICATION_LEVEL_PROTOCOL = "my-protocol-http1_1";
 
-    @Parameterized.Parameters(name = "{index}: bufferType = {0}")
-    public static Collection<Object> data() {
-        List<Object> params = new ArrayList<Object>();
+    @Parameterized.Parameters(name = "{index}: bufferType = {0}, combo = {1}, delegate = {2}")
+    public static Collection<Object[]> data() {
+        List<Object[]> params = new ArrayList<Object[]>();
         for (BufferType type: BufferType.values()) {
-            params.add(type);
+            params.add(new Object[] { type, ProtocolCipherCombo.tlsv12(), false });
+            params.add(new Object[] { type, ProtocolCipherCombo.tlsv12(), true });
+
+            if (OpenSsl.isTlsv13Supported()) {
+                params.add(new Object[] { type, ProtocolCipherCombo.tlsv13(), false });
+                params.add(new Object[] { type, ProtocolCipherCombo.tlsv13(), true });
+            }
         }
         return params;
     }
 
-    public OpenSslEngineTest(BufferType type) {
-        super(type);
+    public OpenSslEngineTest(BufferType type, ProtocolCipherCombo cipherCombo, boolean delegate) {
+        super(type, cipherCombo, delegate);
     }
 
     @BeforeClass
     public static void checkOpenSsl() {
         assumeTrue(OpenSsl.isAvailable());
+    }
+
+    @Override
+    public void tearDown() throws InterruptedException {
+        super.tearDown();
+        assertEquals("SSL error stack not correctly consumed", 0, SSL.getLastErrorNumber());
+    }
+
+    @Override
+    @Test
+    public void testSessionAfterHandshakeKeyManagerFactory() throws Exception {
+        checkShouldUseKeyManagerFactory();
+        super.testSessionAfterHandshakeKeyManagerFactory();
+    }
+
+    @Override
+    @Test
+    public void testSessionAfterHandshakeKeyManagerFactoryMutualAuth() throws Exception {
+        checkShouldUseKeyManagerFactory();
+        super.testSessionAfterHandshakeKeyManagerFactoryMutualAuth();
     }
 
     @Override
@@ -114,21 +147,49 @@ public class OpenSslEngineTest extends SSLEngineTest {
     }
 
     @Override
-    @Test
-    public void testClientHostnameValidationSuccess() throws InterruptedException, SSLException {
-        assumeTrue(OpenSsl.supportsHostnameValidation());
-        super.testClientHostnameValidationSuccess();
+    public void testHandshakeSession() throws Exception {
+        checkShouldUseKeyManagerFactory();
+        super.testHandshakeSession();
     }
 
     @Override
     @Test
-    public void testClientHostnameValidationFail() throws InterruptedException, SSLException {
-        assumeTrue(OpenSsl.supportsHostnameValidation());
-        super.testClientHostnameValidationFail();
+    public void testSupportedSignatureAlgorithms() throws Exception {
+        checkShouldUseKeyManagerFactory();
+        super.testSupportedSignatureAlgorithms();
     }
 
+    private static boolean isNpnSupported(String versionString) {
+        String[] versionStringParts = versionString.split(" ", -1);
+        if (versionStringParts.length == 2 && "LibreSSL".equals(versionStringParts[0])) {
+            String[] versionParts = versionStringParts[1].split("\\.", -1);
+            if (versionParts.length == 3) {
+                int major = Integer.parseInt(versionParts[0]);
+                if (major < 2) {
+                    return true;
+                }
+                if (major > 2) {
+                    return false;
+                }
+                int minor = Integer.parseInt(versionParts[1]);
+                if (minor < 6) {
+                    return true;
+                }
+                if (minor > 6) {
+                    return false;
+                }
+                int bugfix = Integer.parseInt(versionParts[2]);
+                if (bugfix > 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
     @Test
     public void testNpn() throws Exception {
+        String versionString = OpenSsl.versionString();
+        assumeTrue("LibreSSL 2.6.1 removed NPN support, detected " + versionString, isNpnSupported(versionString));
         ApplicationProtocolConfig apn = acceptingNegotiator(Protocol.NPN,
                 PREFERRED_APPLICATION_LEVEL_PROTOCOL);
         setupHandlers(apn);
@@ -164,18 +225,22 @@ public class OpenSslEngineTest extends SSLEngineTest {
     @Test
     public void testWrapBuffersNoWritePendingError() throws Exception {
         clientSslCtx = SslContextBuilder.forClient()
-                .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                .sslProvider(sslClientProvider())
-                .build();
+                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                        .sslProvider(sslClientProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .sslProvider(sslServerProvider())
-                .build();
+                                        .sslProvider(sslServerProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
         SSLEngine clientEngine = null;
         SSLEngine serverEngine = null;
         try {
-            clientEngine = clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
-            serverEngine = serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            clientEngine = wrapEngine(clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
+            serverEngine = wrapEngine(serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
             handshake(clientEngine, serverEngine);
 
             ByteBuffer src = allocateBuffer(1024 * 10);
@@ -198,18 +263,22 @@ public class OpenSslEngineTest extends SSLEngineTest {
     @Test
     public void testOnlySmallBufferNeededForWrap() throws Exception {
         clientSslCtx = SslContextBuilder.forClient()
-                .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                .sslProvider(sslClientProvider())
-                .build();
+                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                        .sslProvider(sslClientProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .sslProvider(sslServerProvider())
-                .build();
+                                        .sslProvider(sslServerProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
         SSLEngine clientEngine = null;
         SSLEngine serverEngine = null;
         try {
-            clientEngine = clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
-            serverEngine = serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            clientEngine = wrapEngine(clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
+            serverEngine = wrapEngine(serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
             handshake(clientEngine, serverEngine);
 
             // Allocate a buffer which is small enough and set the limit to the capacity to mark its whole content
@@ -218,9 +287,9 @@ public class OpenSslEngineTest extends SSLEngineTest {
             ByteBuffer src = allocateBuffer(srcLen);
 
             ByteBuffer dstTooSmall = allocateBuffer(
-                    src.capacity() + MAX_TLS_RECORD_OVERHEAD_LENGTH - 1);
+                    src.capacity() + unwrapEngine(clientEngine).maxWrapOverhead() - 1);
             ByteBuffer dst = allocateBuffer(
-                    src.capacity() + MAX_TLS_RECORD_OVERHEAD_LENGTH);
+                    src.capacity() + unwrapEngine(clientEngine).maxWrapOverhead());
 
             // Check that we fail to wrap if the dst buffers capacity is not at least
             // src.capacity() + ReferenceCountedOpenSslEngine.MAX_TLS_RECORD_OVERHEAD_LENGTH
@@ -249,25 +318,29 @@ public class OpenSslEngineTest extends SSLEngineTest {
     @Test
     public void testNeededDstCapacityIsCorrectlyCalculated() throws Exception {
         clientSslCtx = SslContextBuilder.forClient()
-                .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                .sslProvider(sslClientProvider())
-                .build();
+                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                        .sslProvider(sslClientProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .sslProvider(sslServerProvider())
-                .build();
+                                        .sslProvider(sslServerProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
         SSLEngine clientEngine = null;
         SSLEngine serverEngine = null;
         try {
-            clientEngine = clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
-            serverEngine = serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            clientEngine = wrapEngine(clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
+            serverEngine = wrapEngine(serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
             handshake(clientEngine, serverEngine);
 
             ByteBuffer src = allocateBuffer(1024);
             ByteBuffer src2 = src.duplicate();
 
             ByteBuffer dst = allocateBuffer(src.capacity()
-                    + MAX_TLS_RECORD_OVERHEAD_LENGTH);
+                    + unwrapEngine(clientEngine).maxWrapOverhead());
 
             SSLEngineResult result = clientEngine.wrap(new ByteBuffer[] { src, src2 }, dst);
             assertEquals(SSLEngineResult.Status.BUFFER_OVERFLOW, result.getStatus());
@@ -285,18 +358,22 @@ public class OpenSslEngineTest extends SSLEngineTest {
     @Test
     public void testSrcsLenOverFlowCorrectlyHandled() throws Exception {
         clientSslCtx = SslContextBuilder.forClient()
-                .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                .sslProvider(sslClientProvider())
-                .build();
+                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                        .sslProvider(sslClientProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .sslProvider(sslServerProvider())
-                .build();
+                                        .sslProvider(sslServerProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
         SSLEngine clientEngine = null;
         SSLEngine serverEngine = null;
         try {
-            clientEngine = clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
-            serverEngine = serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            clientEngine = wrapEngine(clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
+            serverEngine = wrapEngine(serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
             handshake(clientEngine, serverEngine);
 
             ByteBuffer src = allocateBuffer(1024);
@@ -310,9 +387,9 @@ public class OpenSslEngineTest extends SSLEngineTest {
                 srcsLen += dup.capacity();
             }
 
-            ByteBuffer[] srcs = srcList.toArray(new ByteBuffer[srcList.size()]);
-
-            ByteBuffer dst = allocateBuffer(MAX_ENCRYPTED_PACKET_LENGTH - 1);
+            ByteBuffer[] srcs = srcList.toArray(new ByteBuffer[0]);
+            ByteBuffer dst = allocateBuffer(
+                    unwrapEngine(clientEngine).maxEncryptedPacketLength() - 1);
 
             SSLEngineResult result = clientEngine.wrap(srcs, dst);
             assertEquals(SSLEngineResult.Status.BUFFER_OVERFLOW, result.getStatus());
@@ -330,21 +407,104 @@ public class OpenSslEngineTest extends SSLEngineTest {
     }
 
     @Test
-    public void testCalculateOutNetBufSizeOverflow() {
-        assertEquals(MAX_ENCRYPTED_PACKET_LENGTH,
-                ReferenceCountedOpenSslEngine.calculateOutNetBufSize(MAX_VALUE, 1));
+    public void testCalculateOutNetBufSizeOverflow() throws SSLException {
+        clientSslCtx = SslContextBuilder.forClient()
+                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                        .sslProvider(sslClientProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
+        SSLEngine clientEngine = null;
+        try {
+            clientEngine = clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            int value = ((ReferenceCountedOpenSslEngine) clientEngine).calculateMaxLengthForWrap(MAX_VALUE, 1);
+            assertTrue("unexpected value: " + value, value > 0);
+        } finally {
+            cleanupClientSslEngine(clientEngine);
+        }
     }
 
     @Test
-    public void testCalculateOutNetBufSize0() {
-        assertEquals(MAX_TLS_RECORD_OVERHEAD_LENGTH,
-                ReferenceCountedOpenSslEngine.calculateOutNetBufSize(0, 1));
+    public void testCalculateOutNetBufSize0() throws SSLException {
+        clientSslCtx = SslContextBuilder.forClient()
+                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                        .sslProvider(sslClientProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
+        SSLEngine clientEngine = null;
+        try {
+            clientEngine = clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            assertTrue(((ReferenceCountedOpenSslEngine) clientEngine).calculateMaxLengthForWrap(0, 1) > 0);
+        } finally {
+            cleanupClientSslEngine(clientEngine);
+        }
     }
 
     @Test
-    public void testCalculateOutNetBufSizeMaxEncryptedPacketLength() {
-        assertEquals(MAX_ENCRYPTED_PACKET_LENGTH,
-                ReferenceCountedOpenSslEngine.calculateOutNetBufSize(MAX_ENCRYPTED_PACKET_LENGTH + 1, 2));
+    public void testCorrectlyCalculateSpaceForAlert() throws Exception {
+        testCorrectlyCalculateSpaceForAlert(true);
+    }
+
+    @Test
+    public void testCorrectlyCalculateSpaceForAlertJDKCompatabilityModeOff() throws Exception {
+        testCorrectlyCalculateSpaceForAlert(false);
+    }
+
+    private void testCorrectlyCalculateSpaceForAlert(boolean jdkCompatabilityMode) throws Exception {
+        SelfSignedCertificate ssc = new SelfSignedCertificate();
+        serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
+                                        .sslProvider(sslServerProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
+
+        clientSslCtx = SslContextBuilder.forClient()
+                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                        .sslProvider(sslClientProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
+        SSLEngine clientEngine = null;
+        SSLEngine serverEngine = null;
+        try {
+            if (jdkCompatabilityMode) {
+                clientEngine = wrapEngine(clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
+                serverEngine = wrapEngine(serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
+            } else {
+                clientEngine = wrapEngine(clientSslCtx.newHandler(UnpooledByteBufAllocator.DEFAULT).engine());
+                serverEngine = wrapEngine(serverSslCtx.newHandler(UnpooledByteBufAllocator.DEFAULT).engine());
+            }
+            handshake(clientEngine, serverEngine);
+
+            // This should produce an alert
+            clientEngine.closeOutbound();
+
+            ByteBuffer empty = allocateBuffer(0);
+            ByteBuffer dst = allocateBuffer(clientEngine.getSession().getPacketBufferSize());
+            // Limit to something that is guaranteed to be too small to hold a SSL Record.
+            dst.limit(1);
+
+            // As we called closeOutbound() before this should produce a BUFFER_OVERFLOW.
+            SSLEngineResult result = clientEngine.wrap(empty, dst);
+            assertEquals(SSLEngineResult.Status.BUFFER_OVERFLOW, result.getStatus());
+
+            // This must calculate a length that can hold an alert at least (or more).
+            dst.limit(dst.capacity());
+
+            result = clientEngine.wrap(empty, dst);
+            assertEquals(SSLEngineResult.Status.CLOSED, result.getStatus());
+
+            // flip the buffer so we can verify we produced a full length buffer.
+            dst.flip();
+
+            int length = SslUtils.getEncryptedPacketLength(new ByteBuffer[] { dst }, 0);
+            assertEquals(length, dst.remaining());
+        } finally {
+            cleanupClientSslEngine(clientEngine);
+            cleanupServerSslEngine(serverEngine);
+            ssc.delete();
+        }
     }
 
     @Override
@@ -356,81 +516,60 @@ public class OpenSslEngineTest extends SSLEngineTest {
     @Test
     public void testWrapWithDifferentSizesTLSv1() throws Exception {
         clientSslCtx = SslContextBuilder.forClient()
-                .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                .sslProvider(sslClientProvider())
-                .build();
+                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                        .sslProvider(sslClientProvider())
+                                        .build();
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .sslProvider(sslServerProvider())
-                .build();
+                                        .sslProvider(sslServerProvider())
+                                        .build();
 
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ADH-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ECDHE-RSA-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ADH-CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "AECDH-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "AECDH-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "DHE-RSA-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "RC4-MD5");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ADH-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ADH-SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ADH-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "EDH-RSA-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ADH-RC4-MD5");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "IDEA-CBC-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "DHE-RSA-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "RC4-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "AECDH-RC4-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "DHE-RSA-SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "AECDH-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ECDHE-RSA-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ADH-CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "DHE-RSA-CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ECDHE-RSA-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "DHE-RSA-CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1, "ECDHE-RSA-RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "AES128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "ECDHE-RSA-AES128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "AECDH-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "CAMELLIA128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "SEED-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "RC4-MD5");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "AES256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "ADH-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "EDH-RSA-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "ADH-RC4-MD5");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "IDEA-CBC-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "CAMELLIA256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "AECDH-RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "ECDHE-RSA-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "ECDHE-RSA-AES256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1, "ECDHE-RSA-RC4-SHA");
     }
 
     @Test
     public void testWrapWithDifferentSizesTLSv1_1() throws Exception {
         clientSslCtx = SslContextBuilder.forClient()
-                .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                .sslProvider(sslClientProvider())
-                .build();
+                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                        .sslProvider(sslClientProvider())
+                                        .build();
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .sslProvider(sslServerProvider())
-                .build();
+                                        .sslProvider(sslServerProvider())
+                                        .build();
 
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "ECDHE-RSA-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "DHE-RSA-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "DHE-RSA-CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "ADH-CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "ADH-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "AECDH-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "DHE-RSA-CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "ECDHE-RSA-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "ADH-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "ADH-SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "ADH-CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "IDEA-CBC-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "AECDH-RC4-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "ADH-RC4-MD5");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "RC4-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "ECDHE-RSA-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "EDH-RSA-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "AECDH-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "ADH-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_1, "DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "ECDHE-RSA-AES256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "AES256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "CAMELLIA256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "ECDHE-RSA-AES256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "SEED-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "CAMELLIA128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "IDEA-CBC-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "AECDH-RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "ADH-RC4-MD5");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "ECDHE-RSA-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "EDH-RSA-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "AECDH-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "ADH-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_1, "DES-CBC3-SHA");
     }
 
     @Test
@@ -444,52 +583,31 @@ public class OpenSslEngineTest extends SSLEngineTest {
                 .sslProvider(sslServerProvider())
                 .build();
 
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "DHE-RSA-AES256-GCM-SHA384");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "AECDH-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "AES128-GCM-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "DHE-RSA-AES128-GCM-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES256-SHA384");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "AECDH-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "AES256-GCM-SHA384");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "AES256-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES128-GCM-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES128-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "DHE-RSA-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "RC4-MD5");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "DHE-RSA-AES128-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "EDH-RSA-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-RC4-MD5");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "IDEA-CBC-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "DHE-RSA-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "RC4-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-AES128-GCM-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "AES128-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "AECDH-RC4-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-AES256-GCM-SHA384");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "DHE-RSA-SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "DHE-RSA-AES256-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "AECDH-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ECDHE-RSA-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES256-GCM-SHA384");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "DHE-RSA-CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-AES256-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ADH-AES128-SHA256");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "DHE-RSA-CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_TLS_V1_2, "ECDHE-RSA-RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "AES128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "AES128-GCM-SHA256");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES256-SHA384");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "AECDH-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "AES256-GCM-SHA384");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "AES256-SHA256");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES128-GCM-SHA256");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES128-SHA256");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "CAMELLIA128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "SEED-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "RC4-MD5");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "AES256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "ADH-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "EDH-RSA-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "ADH-RC4-MD5");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "CAMELLIA256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "AES128-SHA256");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "AECDH-RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "ECDHE-RSA-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES256-GCM-SHA384");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "ECDHE-RSA-AES256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_TLS_V1_2, "ECDHE-RSA-RC4-SHA");
     }
 
     @Test
@@ -503,34 +621,364 @@ public class OpenSslEngineTest extends SSLEngineTest {
                 .sslProvider(sslServerProvider())
                 .build();
 
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "ADH-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "ADH-CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "AECDH-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "AECDH-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "DHE-RSA-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "RC4-MD5");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "ADH-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "ADH-SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "ADH-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "EDH-RSA-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "ADH-RC4-MD5");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "IDEA-CBC-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "DHE-RSA-AES128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "RC4-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "AECDH-RC4-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "DHE-RSA-SEED-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "AECDH-AES256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "ECDHE-RSA-DES-CBC3-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "ADH-CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "DHE-RSA-CAMELLIA256-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "DHE-RSA-CAMELLIA128-SHA");
-        testWrapWithDifferentSizes(OpenSsl.PROTOCOL_SSL_V3, "ECDHE-RSA-RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "ADH-AES128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "ADH-CAMELLIA128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "AECDH-AES128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "AECDH-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "CAMELLIA128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "DHE-RSA-AES256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "SEED-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "RC4-MD5");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "ADH-AES256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "ADH-SEED-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "ADH-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "EDH-RSA-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "ADH-RC4-MD5");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "IDEA-CBC-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "DHE-RSA-AES128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "CAMELLIA256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "AECDH-RC4-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "DHE-RSA-SEED-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "AECDH-AES256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "ECDHE-RSA-DES-CBC3-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "ADH-CAMELLIA256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "DHE-RSA-CAMELLIA256-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "DHE-RSA-CAMELLIA128-SHA");
+        testWrapWithDifferentSizes(PROTOCOL_SSL_V3, "ECDHE-RSA-RC4-SHA");
+    }
+
+    @Test
+    public void testMultipleRecordsInOneBufferWithNonZeroPositionJDKCompatabilityModeOff() throws Exception {
+        SelfSignedCertificate cert = new SelfSignedCertificate();
+
+        clientSslCtx = SslContextBuilder
+                .forClient()
+                .trustManager(cert.cert())
+                .sslProvider(sslClientProvider())
+                .protocols(protocols())
+                .ciphers(ciphers())
+                .build();
+        SSLEngine client = wrapEngine(clientSslCtx.newHandler(UnpooledByteBufAllocator.DEFAULT).engine());
+
+        serverSslCtx = SslContextBuilder
+                .forServer(cert.certificate(), cert.privateKey())
+                .sslProvider(sslServerProvider())
+                .protocols(protocols())
+                .ciphers(ciphers())
+                .build();
+        SSLEngine server = wrapEngine(serverSslCtx.newHandler(UnpooledByteBufAllocator.DEFAULT).engine());
+
+        try {
+            // Choose buffer size small enough that we can put multiple buffers into one buffer and pass it into the
+            // unwrap call without exceed MAX_ENCRYPTED_PACKET_LENGTH.
+            final int plainClientOutLen = 1024;
+            ByteBuffer plainClientOut = allocateBuffer(plainClientOutLen);
+            ByteBuffer plainServerOut = allocateBuffer(server.getSession().getApplicationBufferSize());
+
+            ByteBuffer encClientToServer = allocateBuffer(client.getSession().getPacketBufferSize());
+
+            int positionOffset = 1;
+            // We need to be able to hold 2 records + positionOffset
+            ByteBuffer combinedEncClientToServer = allocateBuffer(
+                    encClientToServer.capacity() * 2 + positionOffset);
+            combinedEncClientToServer.position(positionOffset);
+
+            handshake(client, server);
+
+            plainClientOut.limit(plainClientOut.capacity());
+            SSLEngineResult result = client.wrap(plainClientOut, encClientToServer);
+            assertEquals(plainClientOut.capacity(), result.bytesConsumed());
+            assertTrue(result.bytesProduced() > 0);
+
+            encClientToServer.flip();
+
+            // Copy the first record into the combined buffer
+            combinedEncClientToServer.put(encClientToServer);
+
+            plainClientOut.clear();
+            encClientToServer.clear();
+
+            result = client.wrap(plainClientOut, encClientToServer);
+            assertEquals(plainClientOut.capacity(), result.bytesConsumed());
+            assertTrue(result.bytesProduced() > 0);
+
+            encClientToServer.flip();
+
+            // Copy the first record into the combined buffer
+            combinedEncClientToServer.put(encClientToServer);
+
+            encClientToServer.clear();
+
+            combinedEncClientToServer.flip();
+            combinedEncClientToServer.position(positionOffset);
+
+            // Make sure the limit takes positionOffset into account to the content we are looking at is correct.
+            combinedEncClientToServer.limit(
+                    combinedEncClientToServer.limit() - positionOffset);
+            final int combinedEncClientToServerLen = combinedEncClientToServer.remaining();
+
+            result = server.unwrap(combinedEncClientToServer, plainServerOut);
+            assertEquals(0, combinedEncClientToServer.remaining());
+            assertEquals(combinedEncClientToServerLen, result.bytesConsumed());
+            assertEquals(plainClientOutLen, result.bytesProduced());
+        } finally {
+            cert.delete();
+            cleanupClientSslEngine(client);
+            cleanupServerSslEngine(server);
+        }
+    }
+
+    @Test
+    public void testInputTooBigAndFillsUpBuffersJDKCompatabilityModeOff() throws Exception {
+        SelfSignedCertificate cert = new SelfSignedCertificate();
+
+        clientSslCtx = SslContextBuilder
+                .forClient()
+                .trustManager(cert.cert())
+                .sslProvider(sslClientProvider())
+                .protocols(protocols())
+                .ciphers(ciphers())
+                .build();
+        SSLEngine client = wrapEngine(clientSslCtx.newHandler(UnpooledByteBufAllocator.DEFAULT).engine());
+
+        serverSslCtx = SslContextBuilder
+                .forServer(cert.certificate(), cert.privateKey())
+                .sslProvider(sslServerProvider())
+                .protocols(protocols())
+                .ciphers(ciphers())
+                .build();
+        SSLEngine server = wrapEngine(serverSslCtx.newHandler(UnpooledByteBufAllocator.DEFAULT).engine());
+
+        try {
+            ByteBuffer plainClient = allocateBuffer(MAX_PLAINTEXT_LENGTH + 100);
+            ByteBuffer plainClient2 = allocateBuffer(512);
+            ByteBuffer plainClientTotal = allocateBuffer(plainClient.capacity() + plainClient2.capacity());
+            plainClientTotal.put(plainClient);
+            plainClientTotal.put(plainClient2);
+            plainClient.clear();
+            plainClient2.clear();
+            plainClientTotal.flip();
+
+            // The capacity is designed to trigger an overflow condition.
+            ByteBuffer encClientToServerTooSmall = allocateBuffer(MAX_PLAINTEXT_LENGTH + 28);
+            ByteBuffer encClientToServer = allocateBuffer(client.getSession().getApplicationBufferSize());
+            ByteBuffer encClientToServerTotal = allocateBuffer(client.getSession().getApplicationBufferSize() << 1);
+            ByteBuffer plainServer = allocateBuffer(server.getSession().getApplicationBufferSize() << 1);
+
+            handshake(client, server);
+
+            int plainClientRemaining = plainClient.remaining();
+            int encClientToServerTooSmallRemaining = encClientToServerTooSmall.remaining();
+            SSLEngineResult result = client.wrap(plainClient, encClientToServerTooSmall);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(plainClientRemaining - plainClient.remaining(), result.bytesConsumed());
+            assertEquals(encClientToServerTooSmallRemaining - encClientToServerTooSmall.remaining(),
+                    result.bytesProduced());
+
+            result = client.wrap(plainClient, encClientToServerTooSmall);
+            assertEquals(SSLEngineResult.Status.BUFFER_OVERFLOW, result.getStatus());
+            assertEquals(0, result.bytesConsumed());
+            assertEquals(0, result.bytesProduced());
+
+            plainClientRemaining = plainClient.remaining();
+            int encClientToServerRemaining = encClientToServer.remaining();
+            result = client.wrap(plainClient, encClientToServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(plainClientRemaining, result.bytesConsumed());
+            assertEquals(encClientToServerRemaining - encClientToServer.remaining(), result.bytesProduced());
+            assertEquals(0, plainClient.remaining());
+
+            final int plainClient2Remaining = plainClient2.remaining();
+            encClientToServerRemaining = encClientToServer.remaining();
+            result = client.wrap(plainClient2, encClientToServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(plainClient2Remaining, result.bytesConsumed());
+            assertEquals(encClientToServerRemaining - encClientToServer.remaining(), result.bytesProduced());
+
+            // Concatenate the too small buffer
+            encClientToServerTooSmall.flip();
+            encClientToServer.flip();
+            encClientToServerTotal.put(encClientToServerTooSmall);
+            encClientToServerTotal.put(encClientToServer);
+            encClientToServerTotal.flip();
+
+            // Unwrap in a single call.
+            final int encClientToServerTotalRemaining = encClientToServerTotal.remaining();
+            result = server.unwrap(encClientToServerTotal, plainServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(encClientToServerTotalRemaining, result.bytesConsumed());
+            plainServer.flip();
+            assertEquals(plainClientTotal, plainServer);
+        } finally {
+            cert.delete();
+            cleanupClientSslEngine(client);
+            cleanupServerSslEngine(server);
+        }
+    }
+
+    @Test
+    public void testPartialPacketUnwrapJDKCompatabilityModeOff() throws Exception {
+        SelfSignedCertificate cert = new SelfSignedCertificate();
+
+        clientSslCtx = SslContextBuilder
+                .forClient()
+                .trustManager(cert.cert())
+                .sslProvider(sslClientProvider())
+                .protocols(protocols())
+                .ciphers(ciphers())
+                .build();
+        SSLEngine client = wrapEngine(clientSslCtx.newHandler(UnpooledByteBufAllocator.DEFAULT).engine());
+
+        serverSslCtx = SslContextBuilder
+                .forServer(cert.certificate(), cert.privateKey())
+                .sslProvider(sslServerProvider())
+                .protocols(protocols())
+                .ciphers(ciphers())
+                .build();
+        SSLEngine server = wrapEngine(serverSslCtx.newHandler(UnpooledByteBufAllocator.DEFAULT).engine());
+
+        try {
+            ByteBuffer plainClient = allocateBuffer(1024);
+            ByteBuffer plainClient2 = allocateBuffer(512);
+            ByteBuffer plainClientTotal = allocateBuffer(plainClient.capacity() + plainClient2.capacity());
+            plainClientTotal.put(plainClient);
+            plainClientTotal.put(plainClient2);
+            plainClient.clear();
+            plainClient2.clear();
+            plainClientTotal.flip();
+
+            ByteBuffer encClientToServer = allocateBuffer(client.getSession().getPacketBufferSize());
+            ByteBuffer plainServer = allocateBuffer(server.getSession().getApplicationBufferSize());
+
+            handshake(client, server);
+
+            SSLEngineResult result = client.wrap(plainClient, encClientToServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(result.bytesConsumed(), plainClient.capacity());
+            final int encClientLen = result.bytesProduced();
+
+            result = client.wrap(plainClient2, encClientToServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(result.bytesConsumed(), plainClient2.capacity());
+            final int encClientLen2 = result.bytesProduced();
+
+            // Flip so we can read it.
+            encClientToServer.flip();
+
+            // Consume a partial TLS packet.
+            ByteBuffer encClientFirstHalf = encClientToServer.duplicate();
+            encClientFirstHalf.limit(encClientLen / 2);
+            result = server.unwrap(encClientFirstHalf, plainServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(result.bytesConsumed(), encClientLen / 2);
+            encClientToServer.position(result.bytesConsumed());
+
+            // We now have half of the first packet and the whole second packet, so lets decode all but the last byte.
+            ByteBuffer encClientAllButLastByte = encClientToServer.duplicate();
+            final int encClientAllButLastByteLen = encClientAllButLastByte.remaining() - 1;
+            encClientAllButLastByte.limit(encClientAllButLastByte.limit() - 1);
+            result = server.unwrap(encClientAllButLastByte, plainServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(result.bytesConsumed(), encClientAllButLastByteLen);
+            encClientToServer.position(encClientToServer.position() + result.bytesConsumed());
+
+            // Read the last byte and verify the original content has been decrypted.
+            result = server.unwrap(encClientToServer, plainServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(result.bytesConsumed(), 1);
+            plainServer.flip();
+            assertEquals(plainClientTotal, plainServer);
+        } finally {
+            cert.delete();
+            cleanupClientSslEngine(client);
+            cleanupServerSslEngine(server);
+        }
+    }
+
+    @Test
+    public void testBufferUnderFlowAvoidedIfJDKCompatabilityModeOff() throws Exception {
+        SelfSignedCertificate cert = new SelfSignedCertificate();
+
+        clientSslCtx = SslContextBuilder
+                .forClient()
+                .trustManager(cert.cert())
+                .sslProvider(sslClientProvider())
+                .protocols(protocols())
+                .ciphers(ciphers())
+                .build();
+        SSLEngine client = wrapEngine(clientSslCtx.newHandler(UnpooledByteBufAllocator.DEFAULT).engine());
+
+        serverSslCtx = SslContextBuilder
+                .forServer(cert.certificate(), cert.privateKey())
+                .sslProvider(sslServerProvider())
+                .protocols(protocols())
+                .ciphers(ciphers())
+                .build();
+        SSLEngine server = wrapEngine(serverSslCtx.newHandler(UnpooledByteBufAllocator.DEFAULT).engine());
+
+        try {
+            ByteBuffer plainClient = allocateBuffer(1024);
+            plainClient.limit(plainClient.capacity());
+
+            ByteBuffer encClientToServer = allocateBuffer(client.getSession().getPacketBufferSize());
+            ByteBuffer plainServer = allocateBuffer(server.getSession().getApplicationBufferSize());
+
+            handshake(client, server);
+
+            SSLEngineResult result = client.wrap(plainClient, encClientToServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(result.bytesConsumed(), plainClient.capacity());
+
+            // Flip so we can read it.
+            encClientToServer.flip();
+            int remaining = encClientToServer.remaining();
+
+            // We limit the buffer so we have less then the header to read, this should result in an BUFFER_UNDERFLOW.
+            encClientToServer.limit(SslUtils.SSL_RECORD_HEADER_LENGTH - 1);
+            result = server.unwrap(encClientToServer, plainServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(SslUtils.SSL_RECORD_HEADER_LENGTH - 1, result.bytesConsumed());
+            assertEquals(0, result.bytesProduced());
+            remaining -= result.bytesConsumed();
+
+            // We limit the buffer so we can read the header but not the rest, this should result in an
+            // BUFFER_UNDERFLOW.
+            encClientToServer.limit(SslUtils.SSL_RECORD_HEADER_LENGTH);
+            result = server.unwrap(encClientToServer, plainServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(1, result.bytesConsumed());
+            assertEquals(0, result.bytesProduced());
+            remaining -= result.bytesConsumed();
+
+            // We limit the buffer so we can read the header and partly the rest, this should result in an
+            // BUFFER_UNDERFLOW.
+            encClientToServer.limit(
+                    SslUtils.SSL_RECORD_HEADER_LENGTH  + remaining - 1 - SslUtils.SSL_RECORD_HEADER_LENGTH);
+            result = server.unwrap(encClientToServer, plainServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(encClientToServer.limit() - SslUtils.SSL_RECORD_HEADER_LENGTH, result.bytesConsumed());
+            assertEquals(0, result.bytesProduced());
+            remaining -= result.bytesConsumed();
+
+            // Reset limit so we can read the full record.
+            encClientToServer.limit(remaining);
+            assertEquals(0, encClientToServer.remaining());
+            result = server.unwrap(encClientToServer, plainServer);
+            assertEquals(SSLEngineResult.Status.BUFFER_UNDERFLOW, result.getStatus());
+            assertEquals(0, result.bytesConsumed());
+            assertEquals(0, result.bytesProduced());
+
+            encClientToServer.position(0);
+            result = server.unwrap(encClientToServer, plainServer);
+            assertEquals(SSLEngineResult.Status.OK, result.getStatus());
+            assertEquals(remaining, result.bytesConsumed());
+            assertEquals(0, result.bytesProduced());
+        } finally {
+            cert.delete();
+            cleanupClientSslEngine(client);
+            cleanupServerSslEngine(server);
+        }
     }
 
     private void testWrapWithDifferentSizes(String protocol, String cipher) throws Exception {
@@ -542,8 +990,8 @@ public class OpenSslEngineTest extends SSLEngineTest {
         SSLEngine clientEngine = null;
         SSLEngine serverEngine = null;
         try {
-            clientEngine = clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
-            serverEngine = serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            clientEngine = wrapEngine(clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
+            serverEngine = wrapEngine(serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
             clientEngine.setEnabledCipherSuites(new String[] { cipher });
             clientEngine.setEnabledProtocols(new String[] { protocol });
             serverEngine.setEnabledCipherSuites(new String[] { cipher });
@@ -552,7 +1000,8 @@ public class OpenSslEngineTest extends SSLEngineTest {
             try {
                 handshake(clientEngine, serverEngine);
             } catch (SSLException e) {
-                if (e.getMessage().contains("unsupported protocol")) {
+                if (e.getMessage().contains("unsupported protocol") ||
+                        e.getMessage().contains("no protocols available")) {
                     Assume.assumeNoException(protocol + " not supported with cipher " + cipher, e);
                 }
                 throw e;
@@ -573,7 +1022,7 @@ public class OpenSslEngineTest extends SSLEngineTest {
 
     private void testWrapDstBigEnough(SSLEngine engine, int srcLen) throws SSLException {
         ByteBuffer src = allocateBuffer(srcLen);
-        ByteBuffer dst = allocateBuffer(srcLen + MAX_TLS_RECORD_OVERHEAD_LENGTH);
+        ByteBuffer dst = allocateBuffer(srcLen + unwrapEngine(engine).maxWrapOverhead());
 
         SSLEngineResult result = engine.wrap(src, dst);
         assertEquals(SSLEngineResult.Status.OK, result.getStatus());
@@ -592,14 +1041,40 @@ public class OpenSslEngineTest extends SSLEngineTest {
         assumeTrue(PlatformDependent.javaVersion() >= 8);
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .sslProvider(sslServerProvider())
-                .build();
+                                        .sslProvider(sslServerProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
 
-        SSLEngine engine = serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+        SSLEngine engine = wrapEngine(serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
         try {
             SSLParameters parameters = new SSLParameters();
-            Java8SslTestUtils.setSNIMatcher(parameters);
+            Java8SslTestUtils.setSNIMatcher(parameters, EmptyArrays.EMPTY_BYTES);
             engine.setSSLParameters(parameters);
+        } finally {
+            cleanupServerSslEngine(engine);
+            ssc.delete();
+        }
+    }
+
+    @Test
+    public void testSNIMatchersWithSNINameWithUnderscore() throws Exception {
+        assumeTrue(PlatformDependent.javaVersion() >= 8);
+        byte[] name = "rb8hx3pww30y3tvw0mwy.v1_1".getBytes(CharsetUtil.UTF_8);
+        SelfSignedCertificate ssc = new SelfSignedCertificate();
+        serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
+                                        .sslProvider(sslServerProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
+
+        SSLEngine engine = wrapEngine(serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
+        try {
+            SSLParameters parameters = new SSLParameters();
+            Java8SslTestUtils.setSNIMatcher(parameters, name);
+            engine.setSSLParameters(parameters);
+            assertTrue(unwrapEngine(engine).checkSniHostnameMatch(name));
+            assertFalse(unwrapEngine(engine).checkSniHostnameMatch("other".getBytes(CharsetUtil.UTF_8)));
         } finally {
             cleanupServerSslEngine(engine);
             ssc.delete();
@@ -610,10 +1085,12 @@ public class OpenSslEngineTest extends SSLEngineTest {
     public void testAlgorithmConstraintsThrows() throws Exception {
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .sslProvider(sslServerProvider())
-                .build();
+                                        .sslProvider(sslServerProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
 
-        SSLEngine engine = serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+        SSLEngine engine = wrapEngine(serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
         try {
             SSLParameters parameters = new SSLParameters();
             parameters.setAlgorithmConstraints(new AlgorithmConstraints() {
@@ -657,5 +1134,20 @@ public class OpenSslEngineTest extends SSLEngineTest {
                 SelectorFailureBehavior.NO_ADVERTISE,
                 SelectedListenerFailureBehavior.ACCEPT,
                 supportedProtocols);
+    }
+
+    @Override
+    protected SSLEngine wrapEngine(SSLEngine engine) {
+        if (PlatformDependent.javaVersion() >= 8) {
+            return Java8SslTestUtils.wrapSSLEngineForTesting(engine);
+        }
+        return engine;
+    }
+
+    ReferenceCountedOpenSslEngine unwrapEngine(SSLEngine engine) {
+        if (engine instanceof JdkSslEngine) {
+            return (ReferenceCountedOpenSslEngine) ((JdkSslEngine) engine).getWrappedEngine();
+        }
+        return (ReferenceCountedOpenSslEngine) engine;
     }
 }

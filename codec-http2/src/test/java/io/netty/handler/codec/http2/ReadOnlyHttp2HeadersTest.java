@@ -20,8 +20,9 @@ import org.junit.Test;
 
 import java.util.Iterator;
 import java.util.Map;
+import java.util.NoSuchElementException;
 
-import static io.netty.handler.codec.http2.DefaultHttp2HeadersTest.verifyPseudoHeadersFirst;
+import static io.netty.handler.codec.http2.DefaultHttp2HeadersTest.*;
 import static org.junit.Assert.*;
 
 public class ReadOnlyHttp2HeadersTest {
@@ -134,7 +135,10 @@ public class ReadOnlyHttp2HeadersTest {
     @Test
     public void testContainsNameAndValue() {
         Http2Headers headers = newClientHeaders();
-        assertTrue(headers.contains("Name1", "Value1"));
+        assertTrue(headers.contains("Name1", "value1"));
+        assertFalse(headers.contains("Name1", "Value1"));
+        assertTrue(headers.contains("name2", "Value2", true));
+        assertFalse(headers.contains("name2", "Value2", false));
         assertTrue(headers.contains(Http2Headers.PseudoHeaderName.PATH.value(), "/foo"));
         assertFalse(headers.contains(Http2Headers.PseudoHeaderName.STATUS.value(), "200"));
         assertFalse(headers.contains("a missing header", "a missing value"));
@@ -150,32 +154,82 @@ public class ReadOnlyHttp2HeadersTest {
         assertNull(headers.get("a missing header"));
     }
 
-    private void testIteratorReadOnly(Http2Headers headers) {
+    @Test
+    public void testClientOtherValueIterator() {
+        testValueIteratorSingleValue(newClientHeaders(), "name2", "value2");
+    }
+
+    @Test
+    public void testClientPsuedoValueIterator() {
+        testValueIteratorSingleValue(newClientHeaders(), ":path", "/foo");
+    }
+
+    @Test
+    public void testServerPsuedoValueIterator() {
+        testValueIteratorSingleValue(newServerHeaders(), ":status", "200");
+    }
+
+    @Test
+    public void testEmptyValueIterator() {
+        Http2Headers headers = newServerHeaders();
+        Iterator<CharSequence> itr = headers.valueIterator("foo");
+        assertFalse(itr.hasNext());
+        try {
+            itr.next();
+            fail();
+        } catch (NoSuchElementException ignored) {
+            // ignored
+        }
+    }
+
+    @Test
+    public void testIteratorMultipleValues() {
+        Http2Headers headers = ReadOnlyHttp2Headers.serverHeaders(false, new AsciiString("200"), new AsciiString[] {
+                new AsciiString("name2"), new AsciiString("value1"),
+                new AsciiString("name1"), new AsciiString("value2"),
+                new AsciiString("name2"), new AsciiString("value3")
+        });
+        Iterator<CharSequence> itr = headers.valueIterator("name2");
+        assertTrue(itr.hasNext());
+        assertTrue(AsciiString.contentEqualsIgnoreCase("value1", itr.next()));
+        assertTrue(itr.hasNext());
+        assertTrue(AsciiString.contentEqualsIgnoreCase("value3", itr.next()));
+        assertFalse(itr.hasNext());
+    }
+
+    private static void testValueIteratorSingleValue(Http2Headers headers, CharSequence name, CharSequence value) {
+        Iterator<CharSequence> itr = headers.valueIterator(name);
+        assertTrue(itr.hasNext());
+        assertTrue(AsciiString.contentEqualsIgnoreCase(value, itr.next()));
+        assertFalse(itr.hasNext());
+    }
+
+    private static void testIteratorReadOnly(Http2Headers headers) {
         Iterator<Map.Entry<CharSequence, CharSequence>> itr = headers.iterator();
         assertTrue(itr.hasNext());
         itr.remove();
     }
 
-    private void testIteratorEntryReadOnly(Http2Headers headers) {
+    private static void testIteratorEntryReadOnly(Http2Headers headers) {
         Iterator<Map.Entry<CharSequence, CharSequence>> itr = headers.iterator();
         assertTrue(itr.hasNext());
         itr.next().setValue("foo");
     }
 
-    private ReadOnlyHttp2Headers newServerHeaders() {
+    private static ReadOnlyHttp2Headers newServerHeaders() {
         return ReadOnlyHttp2Headers.serverHeaders(false, new AsciiString("200"), otherHeaders());
     }
 
-    private ReadOnlyHttp2Headers newClientHeaders() {
+    private static ReadOnlyHttp2Headers newClientHeaders() {
         return ReadOnlyHttp2Headers.clientHeaders(false, new AsciiString("meth"), new AsciiString("/foo"),
                 new AsciiString("schemer"), new AsciiString("respect_my_authority"), otherHeaders());
     }
 
-    private ReadOnlyHttp2Headers newTrailers() {
+    private static ReadOnlyHttp2Headers newTrailers() {
         return ReadOnlyHttp2Headers.trailers(false, otherHeaders());
     }
 
-    private AsciiString[] otherHeaders() {
+    private static AsciiString[] otherHeaders() {
         return new AsciiString[] {
                 new AsciiString("name1"), new AsciiString("value1"),
                 new AsciiString("name2"), new AsciiString("value2"),

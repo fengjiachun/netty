@@ -84,6 +84,7 @@ public class HashedWheelTimer implements Timer {
     private static final AtomicInteger INSTANCE_COUNTER = new AtomicInteger();
     private static final AtomicBoolean WARNED_TOO_MANY_INSTANCES = new AtomicBoolean();
     private static final int INSTANCE_COUNT_LIMIT = 64;
+    private static final long MILLISECOND_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
     private static final ResourceLeakDetector<HashedWheelTimer> leakDetector = ResourceLeakDetectorFactory.instance()
             .newResourceLeakDetector(HashedWheelTimer.class, 1);
 
@@ -97,8 +98,8 @@ public class HashedWheelTimer implements Timer {
     public static final int WORKER_STATE_INIT = 0;
     public static final int WORKER_STATE_STARTED = 1;
     public static final int WORKER_STATE_SHUTDOWN = 2;
-    @SuppressWarnings({ "unused", "FieldMayBeFinal", "RedundantFieldInitialization" })
-    private volatile int workerState = WORKER_STATE_INIT; // 0 - init, 1 - started, 2 - shut down
+    @SuppressWarnings({ "unused", "FieldMayBeFinal" })
+    private volatile int workerState; // 0 - init, 1 - started, 2 - shut down
 
     private final long tickDuration;
     private final HashedWheelBucket[] wheel;
@@ -259,14 +260,25 @@ public class HashedWheelTimer implements Timer {
         mask = wheel.length - 1;
 
         // Convert tickDuration to nanos.
-        this.tickDuration = unit.toNanos(tickDuration);
+        long duration = unit.toNanos(tickDuration);
 
         // Prevent overflow.
-        if (this.tickDuration >= Long.MAX_VALUE / wheel.length) {
+        if (duration >= Long.MAX_VALUE / wheel.length) {
             throw new IllegalArgumentException(String.format(
                     "tickDuration: %d (expected: 0 < tickDuration in nanos < %d",
                     tickDuration, Long.MAX_VALUE / wheel.length));
         }
+
+        if (duration < MILLISECOND_NANOS) {
+            if (logger.isWarnEnabled()) {
+                logger.warn("Configured tickDuration %d smaller then %d, using 1ms.",
+                            tickDuration, MILLISECOND_NANOS);
+            }
+            this.tickDuration = MILLISECOND_NANOS;
+        } else {
+            this.tickDuration = duration;
+        }
+
         workerThread = threadFactory.newThread(worker);
 
         leak = leakDetection || !workerThread.isDaemon() ? leakDetector.track(this) : null;
@@ -419,6 +431,11 @@ public class HashedWheelTimer implements Timer {
         // Add the timeout to the timeout queue which will be processed on the next tick.
         // During processing all the queued HashedWheelTimeouts will be added to the correct HashedWheelBucket.
         long deadline = System.nanoTime() + unit.toNanos(delay) - startTime;
+
+        // Guard against overflow.
+        if (delay > 0 && deadline < 0) {
+            deadline = Long.MAX_VALUE;
+        }
         HashedWheelTimeout timeout = new HashedWheelTimeout(this, task, deadline);
         timeouts.add(timeout);
         return timeout;
@@ -432,10 +449,12 @@ public class HashedWheelTimer implements Timer {
     }
 
     private static void reportTooManyInstances() {
-        String resourceType = simpleClassName(HashedWheelTimer.class);
-        logger.error("You are creating too many " + resourceType + " instances. " +
-                resourceType + " is a shared resource that must be reused across the JVM," +
-                "so that only a few instances are created.");
+        if (logger.isErrorEnabled()) {
+            String resourceType = simpleClassName(HashedWheelTimer.class);
+            logger.error("You are creating too many " + resourceType + " instances. " +
+                    resourceType + " is a shared resource that must be reused across the JVM," +
+                    "so that only a few instances are created.");
+        }
     }
 
     private final class Worker implements Runnable {

@@ -15,9 +15,12 @@
  */
 package io.netty.util.concurrent;
 
+import io.netty.util.internal.ThreadExecutorMap;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.util.Queue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executors;
@@ -32,7 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * task pending in the task queue for 1 second.  Please note it is not scalable to schedule large number of tasks to
  * this executor; use a dedicated executor.
  */
-public final class GlobalEventExecutor extends AbstractScheduledEventExecutor {
+public final class GlobalEventExecutor extends AbstractScheduledEventExecutor implements OrderedEventExecutor {
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(GlobalEventExecutor.class);
 
@@ -53,8 +56,7 @@ public final class GlobalEventExecutor extends AbstractScheduledEventExecutor {
     // can trigger the creation of a thread from arbitrary thread groups; for this reason, the thread factory must not
     // be sticky about its thread group
     // visible for testing
-    final ThreadFactory threadFactory =
-            new DefaultThreadFactory(DefaultThreadFactory.toPoolName(getClass()), false, Thread.NORM_PRIORITY, null);
+    final ThreadFactory threadFactory;
     private final TaskRunner taskRunner = new TaskRunner();
     private final AtomicBoolean started = new AtomicBoolean();
     volatile Thread thread;
@@ -63,6 +65,8 @@ public final class GlobalEventExecutor extends AbstractScheduledEventExecutor {
 
     private GlobalEventExecutor() {
         scheduledTaskQueue().add(quietPeriodTask);
+        threadFactory = ThreadExecutorMap.apply(new DefaultThreadFactory(
+                DefaultThreadFactory.toPoolName(getClass()), false, Thread.NORM_PRIORITY, null), this);
     }
 
     /**
@@ -214,7 +218,20 @@ public final class GlobalEventExecutor extends AbstractScheduledEventExecutor {
 
     private void startThread() {
         if (started.compareAndSet(false, true)) {
-            Thread t = threadFactory.newThread(taskRunner);
+            final Thread t = threadFactory.newThread(taskRunner);
+            // Set to null to ensure we not create classloader leaks by holds a strong reference to the inherited
+            // classloader.
+            // See:
+            // - https://github.com/netty/netty/issues/7290
+            // - https://bugs.openjdk.java.net/browse/JDK-7008595
+            AccessController.doPrivileged(new PrivilegedAction<Void>() {
+                @Override
+                public Void run() {
+                    t.setContextClassLoader(null);
+                    return null;
+                }
+            });
+
             // Set the thread before starting it as otherwise inEventLoop() may return false and so produce
             // an assert error.
             // See https://github.com/netty/netty/issues/4357

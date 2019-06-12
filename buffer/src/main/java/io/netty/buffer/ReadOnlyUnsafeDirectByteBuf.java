@@ -27,8 +27,10 @@ import java.nio.ByteBuffer;
 final class ReadOnlyUnsafeDirectByteBuf extends ReadOnlyByteBufferBuf {
     private final long memoryAddress;
 
-    ReadOnlyUnsafeDirectByteBuf(ByteBufAllocator allocator, ByteBuffer buffer) {
-        super(allocator, buffer);
+    ReadOnlyUnsafeDirectByteBuf(ByteBufAllocator allocator, ByteBuffer byteBuffer) {
+        super(allocator, byteBuffer);
+        // Use buffer as the super class will slice the passed in ByteBuffer which means the memoryAddress
+        // may be different if the position != 0.
         memoryAddress = PlatformDependent.directBufferAddress(buffer);
     }
 
@@ -95,20 +97,6 @@ final class ReadOnlyUnsafeDirectByteBuf extends ReadOnlyByteBufferBuf {
     }
 
     @Override
-    public ByteBuf getBytes(int index, ByteBuffer dst) {
-        checkIndex(index);
-        if (dst == null) {
-            throw new NullPointerException("dst");
-        }
-
-        int bytesToCopy = Math.min(capacity() - index, dst.remaining());
-        ByteBuffer tmpBuf = internalNioBuffer();
-        tmpBuf.clear().position(index).limit(index + bytesToCopy);
-        dst.put(tmpBuf);
-        return this;
-    }
-
-    @Override
     public ByteBuf copy(int index, int length) {
         checkIndex(index, length);
         ByteBuf copy = alloc().directBuffer(length, maxCapacity());
@@ -121,6 +109,16 @@ final class ReadOnlyUnsafeDirectByteBuf extends ReadOnlyByteBufferBuf {
             }
         }
         return copy;
+    }
+
+    @Override
+    public boolean hasMemoryAddress() {
+        return true;
+    }
+
+    @Override
+    public long memoryAddress() {
+        return memoryAddress;
     }
 
     private long addr(int index) {

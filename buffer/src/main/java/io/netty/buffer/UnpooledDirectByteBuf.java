@@ -15,6 +15,8 @@
  */
 package io.netty.buffer;
 
+import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
+
 import io.netty.util.internal.PlatformDependent;
 
 import java.io.IOException;
@@ -28,15 +30,15 @@ import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
 
 /**
- * A NIO {@link ByteBuffer} based buffer.  It is recommended to use {@link Unpooled#directBuffer(int)}
- * and {@link Unpooled#wrappedBuffer(ByteBuffer)} instead of calling the
- * constructor explicitly.
+ * A NIO {@link ByteBuffer} based buffer. It is recommended to use
+ * {@link UnpooledByteBufAllocator#directBuffer(int, int)}, {@link Unpooled#directBuffer(int)} and
+ * {@link Unpooled#wrappedBuffer(ByteBuffer)} instead of calling the constructor explicitly.
  */
 public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
 
     private final ByteBufAllocator alloc;
 
-    private ByteBuffer buffer;
+    ByteBuffer buffer; // accessed by UnpooledUnsafeNoCleanerDirectByteBuf.reallocateDirect()
     private ByteBuffer tmpNioBuf;
     private int capacity;
     private boolean doNotFree;
@@ -47,24 +49,20 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
      * @param initialCapacity the initial capacity of the underlying direct buffer
      * @param maxCapacity     the maximum capacity of the underlying direct buffer
      */
-    protected UnpooledDirectByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity) {
+    public UnpooledDirectByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity) {
         super(maxCapacity);
         if (alloc == null) {
             throw new NullPointerException("alloc");
         }
-        if (initialCapacity < 0) {
-            throw new IllegalArgumentException("initialCapacity: " + initialCapacity);
-        }
-        if (maxCapacity < 0) {
-            throw new IllegalArgumentException("maxCapacity: " + maxCapacity);
-        }
+        checkPositiveOrZero(initialCapacity, "initialCapacity");
+        checkPositiveOrZero(maxCapacity, "maxCapacity");
         if (initialCapacity > maxCapacity) {
             throw new IllegalArgumentException(String.format(
                     "initialCapacity(%d) > maxCapacity(%d)", initialCapacity, maxCapacity));
         }
 
         this.alloc = alloc;
-        setByteBuffer(ByteBuffer.allocateDirect(initialCapacity));
+        setByteBuffer(allocateDirect(initialCapacity), false);
     }
 
     /**
@@ -73,6 +71,11 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
      * @param maxCapacity the maximum capacity of the underlying direct buffer
      */
     protected UnpooledDirectByteBuf(ByteBufAllocator alloc, ByteBuffer initialBuffer, int maxCapacity) {
+        this(alloc, initialBuffer, maxCapacity, false, true);
+    }
+
+    UnpooledDirectByteBuf(ByteBufAllocator alloc, ByteBuffer initialBuffer,
+            int maxCapacity, boolean doFree, boolean slice) {
         super(maxCapacity);
         if (alloc == null) {
             throw new NullPointerException("alloc");
@@ -94,8 +97,8 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
         }
 
         this.alloc = alloc;
-        doNotFree = true;
-        setByteBuffer(initialBuffer.slice().order(ByteOrder.BIG_ENDIAN));
+        doNotFree = !doFree;
+        setByteBuffer((slice ? initialBuffer.slice() : initialBuffer).order(ByteOrder.BIG_ENDIAN), false);
         writerIndex(initialCapacity);
     }
 
@@ -113,13 +116,15 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
         PlatformDependent.freeDirectBuffer(buffer);
     }
 
-    private void setByteBuffer(ByteBuffer buffer) {
-        ByteBuffer oldBuffer = this.buffer;
-        if (oldBuffer != null) {
-            if (doNotFree) {
-                doNotFree = false;
-            } else {
-                freeDirect(oldBuffer);
+    void setByteBuffer(ByteBuffer buffer, boolean tryFree) {
+        if (tryFree) {
+            ByteBuffer oldBuffer = this.buffer;
+            if (oldBuffer != null) {
+                if (doNotFree) {
+                    doNotFree = false;
+                } else {
+                    freeDirect(oldBuffer);
+                }
             }
         }
 
@@ -153,7 +158,7 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
             newBuffer.position(0).limit(oldBuffer.capacity());
             newBuffer.put(oldBuffer);
             newBuffer.clear();
-            setByteBuffer(newBuffer);
+            setByteBuffer(newBuffer, true);
         } else if (newCapacity < oldCapacity) {
             ByteBuffer oldBuffer = buffer;
             ByteBuffer newBuffer = allocateDirect(newCapacity);
@@ -168,7 +173,7 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
             } else {
                 setIndex(newCapacity, newCapacity);
             }
-            setByteBuffer(newBuffer);
+            setByteBuffer(newBuffer, true);
         }
         return this;
     }
@@ -310,7 +315,7 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
         return this;
     }
 
-    private void getBytes(int index, byte[] dst, int dstIndex, int length, boolean internal) {
+    void getBytes(int index, byte[] dst, int dstIndex, int length, boolean internal) {
         checkDstIndex(index, length, dstIndex, dst.length);
 
         ByteBuffer tmpBuf;
@@ -337,7 +342,7 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
         return this;
     }
 
-    private void getBytes(int index, ByteBuffer dst, boolean internal) {
+    void getBytes(int index, ByteBuffer dst, boolean internal) {
         checkIndex(index, dst.remaining());
 
         ByteBuffer tmpBuf;
@@ -486,26 +491,12 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
         return this;
     }
 
-    private void getBytes(int index, OutputStream out, int length, boolean internal) throws IOException {
+    void getBytes(int index, OutputStream out, int length, boolean internal) throws IOException {
         ensureAccessible();
         if (length == 0) {
             return;
         }
-
-        if (buffer.hasArray()) {
-            out.write(buffer.array(), index + buffer.arrayOffset(), length);
-        } else {
-            byte[] tmp = new byte[length];
-            ByteBuffer tmpBuf;
-            if (internal) {
-                tmpBuf = internalNioBuffer();
-            } else {
-                tmpBuf = buffer.duplicate();
-            }
-            tmpBuf.clear().position(index);
-            tmpBuf.get(tmp);
-            out.write(tmp);
-        }
+        ByteBufUtil.readBytes(alloc(), internal ? internalNioBuffer() : buffer.duplicate(), index, length, out);
     }
 
     @Override
@@ -575,8 +566,8 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
         if (buffer.hasArray()) {
             return in.read(buffer.array(), buffer.arrayOffset() + index, length);
         } else {
-            byte[] tmp = new byte[length];
-            int readBytes = in.read(tmp);
+            byte[] tmp = ByteBufUtil.threadLocalTempArray(length);
+            int readBytes = in.read(tmp, 0, length);
             if (readBytes <= 0) {
                 return readBytes;
             }
@@ -593,7 +584,7 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
         ByteBuffer tmpBuf = internalNioBuffer();
         tmpBuf.clear().position(index).limit(index + length);
         try {
-            return in.read(tmpNioBuf);
+            return in.read(tmpBuf);
         } catch (ClosedChannelException ignored) {
             return -1;
         }
@@ -605,7 +596,7 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
         ByteBuffer tmpBuf = internalNioBuffer();
         tmpBuf.clear().position(index).limit(index + length);
         try {
-            return in.read(tmpNioBuf, position);
+            return in.read(tmpBuf, position);
         } catch (ClosedChannelException ignored) {
             return -1;
         }

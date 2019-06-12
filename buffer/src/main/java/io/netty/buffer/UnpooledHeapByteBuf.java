@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.EmptyArrays;
 import io.netty.util.internal.PlatformDependent;
 
 import java.io.IOException;
@@ -30,7 +31,9 @@ import java.nio.channels.ScatteringByteChannel;
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
 
 /**
- * Big endian Java heap buffer implementation.
+ * Big endian Java heap buffer implementation. It is recommended to use
+ * {@link UnpooledByteBufAllocator#heapBuffer(int, int)}, {@link Unpooled#buffer(int)} and
+ * {@link Unpooled#wrappedBuffer(byte[])} instead of calling the constructor explicitly.
  */
 public class UnpooledHeapByteBuf extends AbstractReferenceCountedByteBuf {
 
@@ -44,7 +47,7 @@ public class UnpooledHeapByteBuf extends AbstractReferenceCountedByteBuf {
      * @param initialCapacity the initial capacity of the underlying byte array
      * @param maxCapacity the max capacity of the underlying byte array
      */
-    protected UnpooledHeapByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity) {
+    public UnpooledHeapByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity) {
         super(maxCapacity);
 
         checkNotNull(alloc, "alloc");
@@ -81,11 +84,11 @@ public class UnpooledHeapByteBuf extends AbstractReferenceCountedByteBuf {
         setIndex(0, initialArray.length);
     }
 
-    byte[] allocateArray(int initialCapacity) {
+    protected byte[] allocateArray(int initialCapacity) {
         return new byte[initialCapacity];
     }
 
-    void freeArray(byte[] array) {
+    protected void freeArray(byte[] array) {
         // NOOP
     }
 
@@ -111,7 +114,6 @@ public class UnpooledHeapByteBuf extends AbstractReferenceCountedByteBuf {
 
     @Override
     public int capacity() {
-        ensureAccessible();
         return array.length;
     }
 
@@ -192,7 +194,7 @@ public class UnpooledHeapByteBuf extends AbstractReferenceCountedByteBuf {
 
     @Override
     public ByteBuf getBytes(int index, ByteBuffer dst) {
-        checkIndex(index, dst.remaining());
+        ensureAccessible();
         dst.put(array, index, dst.remaining());
         return this;
     }
@@ -534,7 +536,7 @@ public class UnpooledHeapByteBuf extends AbstractReferenceCountedByteBuf {
     @Override
     public ByteBuf copy(int index, int length) {
         checkIndex(index, length);
-        byte[] copiedArray = new byte[length];
+        byte[] copiedArray = PlatformDependent.allocateUninitializedArray(length);
         System.arraycopy(array, index, copiedArray, 0, length);
         return new UnpooledHeapByteBuf(alloc(), copiedArray, maxCapacity());
     }
@@ -550,7 +552,7 @@ public class UnpooledHeapByteBuf extends AbstractReferenceCountedByteBuf {
     @Override
     protected void deallocate() {
         freeArray(array);
-        array = null;
+        array = EmptyArrays.EMPTY_BYTES;
     }
 
     @Override

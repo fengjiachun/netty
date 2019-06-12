@@ -20,10 +20,14 @@ import org.junit.Test;
 
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Iterator;
 
+import static io.netty.handler.codec.http.HttpHeaderNames.SET_COOKIE;
 import static io.netty.util.AsciiString.contentEquals;
+import static org.hamcrest.Matchers.hasSize;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
 public class CombinedHttpHeadersTest {
@@ -63,6 +67,28 @@ public class CombinedHttpHeadersTest {
         otherHeaders.add(HEADER_NAME, "c");
         headers.add(otherHeaders);
         assertEquals("a,b,c", headers.get(HEADER_NAME).toString());
+    }
+
+    @Test
+    public void dontCombineSetCookieHeaders() {
+        final CombinedHttpHeaders headers = newCombinedHttpHeaders();
+        headers.add(SET_COOKIE, "a");
+        final CombinedHttpHeaders otherHeaders = newCombinedHttpHeaders();
+        otherHeaders.add(SET_COOKIE, "b");
+        otherHeaders.add(SET_COOKIE, "c");
+        headers.add(otherHeaders);
+        assertThat(headers.getAll(SET_COOKIE), hasSize(3));
+    }
+
+    @Test
+    public void dontCombineSetCookieHeadersRegardlessOfCase() {
+        final CombinedHttpHeaders headers = newCombinedHttpHeaders();
+        headers.add("Set-Cookie", "a");
+        final CombinedHttpHeaders otherHeaders = newCombinedHttpHeaders();
+        otherHeaders.add("set-cookie", "b");
+        otherHeaders.add("SET-COOKIE", "c");
+        headers.add(otherHeaders);
+        assertThat(headers.getAll(SET_COOKIE), hasSize(3));
     }
 
     @Test
@@ -274,6 +300,15 @@ public class CombinedHttpHeadersTest {
     }
 
     @Test
+    public void getAllDontCombineSetCookie() {
+        final CombinedHttpHeaders headers = newCombinedHttpHeaders();
+        headers.add(SET_COOKIE, "a");
+        headers.add(SET_COOKIE, "b");
+        assertThat(headers.getAll(SET_COOKIE), hasSize(2));
+        assertEquals(Arrays.asList("a", "b"), headers.getAll(SET_COOKIE));
+    }
+
+    @Test
     public void owsTrimming() {
         final CombinedHttpHeaders headers = newCombinedHttpHeaders();
         headers.set(HEADER_NAME, Arrays.asList("\ta", "   ", "  b ", "\t \t"));
@@ -299,5 +334,47 @@ public class CombinedHttpHeadersTest {
 
         HttpHeaders copiedHeaders = newCombinedHttpHeaders().add(headers);
         assertEquals(Arrays.asList("a", "", "b", "", "c, d"), copiedHeaders.getAll(HEADER_NAME));
+    }
+
+    @Test
+    public void valueIterator() {
+        final CombinedHttpHeaders headers = newCombinedHttpHeaders();
+        headers.set(HEADER_NAME, Arrays.asList("\ta", "   ", "  b ", "\t \t"));
+        headers.add(HEADER_NAME, " c, d \t");
+
+        assertFalse(headers.valueStringIterator("foo").hasNext());
+        assertValueIterator(headers.valueStringIterator(HEADER_NAME));
+        assertFalse(headers.valueCharSequenceIterator("foo").hasNext());
+        assertValueIterator(headers.valueCharSequenceIterator(HEADER_NAME));
+    }
+
+    @Test
+    public void nonCombinableHeaderIterator() {
+        final CombinedHttpHeaders headers = newCombinedHttpHeaders();
+        headers.add(SET_COOKIE, "c");
+        headers.add(SET_COOKIE, "b");
+        headers.add(SET_COOKIE, "a");
+
+        final Iterator<String> strItr = headers.valueStringIterator(SET_COOKIE);
+        assertTrue(strItr.hasNext());
+        assertEquals("a", strItr.next());
+        assertTrue(strItr.hasNext());
+        assertEquals("b", strItr.next());
+        assertTrue(strItr.hasNext());
+        assertEquals("c", strItr.next());
+    }
+
+    private static void assertValueIterator(Iterator<? extends CharSequence> strItr) {
+        assertTrue(strItr.hasNext());
+        assertEquals("a", strItr.next());
+        assertTrue(strItr.hasNext());
+        assertEquals("", strItr.next());
+        assertTrue(strItr.hasNext());
+        assertEquals("b", strItr.next());
+        assertTrue(strItr.hasNext());
+        assertEquals("", strItr.next());
+        assertTrue(strItr.hasNext());
+        assertEquals("c, d", strItr.next());
+        assertFalse(strItr.hasNext());
     }
 }

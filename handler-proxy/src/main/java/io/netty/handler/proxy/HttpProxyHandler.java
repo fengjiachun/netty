@@ -25,14 +25,15 @@ import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
-import io.netty.util.NetUtil;
 
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
@@ -46,16 +47,44 @@ public final class HttpProxyHandler extends ProxyHandler {
     private final String username;
     private final String password;
     private final CharSequence authorization;
+    private final HttpHeaders outboundHeaders;
+    private final boolean ignoreDefaultPortsInConnectHostHeader;
     private HttpResponseStatus status;
+    private HttpHeaders inboundHeaders;
 
     public HttpProxyHandler(SocketAddress proxyAddress) {
+        this(proxyAddress, null);
+    }
+
+    public HttpProxyHandler(SocketAddress proxyAddress, HttpHeaders headers) {
+        this(proxyAddress, headers, false);
+    }
+
+    public HttpProxyHandler(SocketAddress proxyAddress,
+                            HttpHeaders headers,
+                            boolean ignoreDefaultPortsInConnectHostHeader) {
         super(proxyAddress);
         username = null;
         password = null;
         authorization = null;
+        this.outboundHeaders = headers;
+        this.ignoreDefaultPortsInConnectHostHeader = ignoreDefaultPortsInConnectHostHeader;
     }
 
     public HttpProxyHandler(SocketAddress proxyAddress, String username, String password) {
+        this(proxyAddress, username, password, null);
+    }
+
+    public HttpProxyHandler(SocketAddress proxyAddress, String username, String password,
+                            HttpHeaders headers) {
+        this(proxyAddress, username, password, headers, false);
+    }
+
+    public HttpProxyHandler(SocketAddress proxyAddress,
+                            String username,
+                            String password,
+                            HttpHeaders headers,
+                            boolean ignoreDefaultPortsInConnectHostHeader) {
         super(proxyAddress);
         if (username == null) {
             throw new NullPointerException("username");
@@ -73,6 +102,9 @@ public final class HttpProxyHandler extends ProxyHandler {
 
         authz.release();
         authzBase64.release();
+
+        this.outboundHeaders = headers;
+        this.ignoreDefaultPortsInConnectHostHeader = ignoreDefaultPortsInConnectHostHeader;
     }
 
     @Override
@@ -113,16 +145,27 @@ public final class HttpProxyHandler extends ProxyHandler {
     @Override
     protected Object newInitialMessage(ChannelHandlerContext ctx) throws Exception {
         InetSocketAddress raddr = destinationAddress();
-        final String host = NetUtil.toSocketAddressString(raddr);
+
+        String hostString = HttpUtil.formatHostnameForHttp(raddr);
+        int port = raddr.getPort();
+        String url = hostString + ":" + port;
+        String hostHeader = (ignoreDefaultPortsInConnectHostHeader && (port == 80 || port == 443)) ?
+                hostString :
+                url;
+
         FullHttpRequest req = new DefaultFullHttpRequest(
                 HttpVersion.HTTP_1_1, HttpMethod.CONNECT,
-                host,
+                url,
                 Unpooled.EMPTY_BUFFER, false);
 
-        req.headers().set(HttpHeaderNames.HOST, host);
+        req.headers().set(HttpHeaderNames.HOST, hostHeader);
 
         if (authorization != null) {
             req.headers().set(HttpHeaderNames.PROXY_AUTHORIZATION, authorization);
+        }
+
+        if (outboundHeaders != null) {
+            req.headers().add(outboundHeaders);
         }
 
         return req;
@@ -132,21 +175,48 @@ public final class HttpProxyHandler extends ProxyHandler {
     protected boolean handleResponse(ChannelHandlerContext ctx, Object response) throws Exception {
         if (response instanceof HttpResponse) {
             if (status != null) {
-                throw new ProxyConnectException(exceptionMessage("too many responses"));
+                throw new HttpProxyConnectException(exceptionMessage("too many responses"), /*headers=*/ null);
             }
-            status = ((HttpResponse) response).status();
+            HttpResponse res = (HttpResponse) response;
+            status = res.status();
+            inboundHeaders = res.headers();
         }
 
         boolean finished = response instanceof LastHttpContent;
         if (finished) {
             if (status == null) {
-                throw new ProxyConnectException(exceptionMessage("missing response"));
+                throw new HttpProxyConnectException(exceptionMessage("missing response"), inboundHeaders);
             }
             if (status.code() != 200) {
-                throw new ProxyConnectException(exceptionMessage("status: " + status));
+                throw new HttpProxyConnectException(exceptionMessage("status: " + status), inboundHeaders);
             }
         }
 
         return finished;
+    }
+
+    /**
+     * Specific case of a connection failure, which may include headers from the proxy.
+     */
+    public static final class HttpProxyConnectException extends ProxyConnectException {
+        private static final long serialVersionUID = -8824334609292146066L;
+
+        private final HttpHeaders headers;
+
+        /**
+         * @param message The failure message.
+         * @param headers Header associated with the connection failure.  May be {@code null}.
+         */
+        public HttpProxyConnectException(String message, HttpHeaders headers) {
+            super(message);
+            this.headers = headers;
+        }
+
+        /**
+         * Returns headers, if any.  May be {@code null}.
+         */
+        public HttpHeaders headers() {
+            return headers;
+        }
     }
 }

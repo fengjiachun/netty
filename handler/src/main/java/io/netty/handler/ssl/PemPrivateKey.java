@@ -41,6 +41,7 @@ import io.netty.util.internal.ObjectUtil;
  * @see #valueOf(ByteBuf)
  */
 public final class PemPrivateKey extends AbstractReferenceCounted implements PrivateKey, PemEncoded {
+    private static final long serialVersionUID = 7978017465645018936L;
 
     private static final byte[] BEGIN_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\n".getBytes(CharsetUtil.US_ASCII);
     private static final byte[] END_PRIVATE_KEY = "\n-----END PRIVATE KEY-----\n".getBytes(CharsetUtil.US_ASCII);
@@ -59,7 +60,16 @@ public final class PemPrivateKey extends AbstractReferenceCounted implements Pri
             return ((PemEncoded) key).retain();
         }
 
-        ByteBuf encoded = Unpooled.wrappedBuffer(key.getEncoded());
+        byte[] bytes = key.getEncoded();
+        if (bytes == null) {
+            throw new IllegalArgumentException(key.getClass().getName() + " does not support encoding");
+        }
+
+        return toPEM(allocator, useDirect, bytes);
+    }
+
+    static PemEncoded toPEM(ByteBufAllocator allocator, boolean useDirect, byte[] bytes) {
+        ByteBuf encoded = Unpooled.wrappedBuffer(bytes);
         try {
             ByteBuf base64 = SslUtils.toBase64(allocator, encoded);
             try {

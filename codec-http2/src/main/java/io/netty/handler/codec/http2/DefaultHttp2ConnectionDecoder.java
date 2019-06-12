@@ -16,6 +16,7 @@ package io.netty.handler.codec.http2;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.http.HttpStatusClass;
 import io.netty.handler.codec.http2.Http2Connection.Endpoint;
 import io.netty.util.internal.UnstableApi;
 import io.netty.util.internal.logging.InternalLogger;
@@ -23,6 +24,7 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.util.List;
 
+import static io.netty.handler.codec.http.HttpStatusClass.INFORMATIONAL;
 import static io.netty.handler.codec.http2.Http2CodecUtil.DEFAULT_PRIORITY_WEIGHT;
 import static io.netty.handler.codec.http2.Http2Error.INTERNAL_ERROR;
 import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
@@ -55,6 +57,7 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
     private final Http2FrameReader frameReader;
     private Http2FrameListener listener;
     private final Http2PromisedRequestVerifier requestVerifier;
+    private final Http2SettingsReceivedConsumer settingsReceivedConsumer;
 
     public DefaultHttp2ConnectionDecoder(Http2Connection connection,
                                          Http2ConnectionEncoder encoder,
@@ -66,6 +69,35 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
                                          Http2ConnectionEncoder encoder,
                                          Http2FrameReader frameReader,
                                          Http2PromisedRequestVerifier requestVerifier) {
+        this(connection, encoder, frameReader, requestVerifier, true);
+    }
+
+    /**
+     * Create a new instance.
+     * @param connection The {@link Http2Connection} associated with this decoder.
+     * @param encoder The {@link Http2ConnectionEncoder} associated with this decoder.
+     * @param frameReader Responsible for reading/parsing the raw frames. As opposed to this object which applies
+     *                    h2 semantics on top of the frames.
+     * @param requestVerifier Determines if push promised streams are valid.
+     * @param autoAckSettings {@code false} to disable automatically applying and sending settings acknowledge frame.
+     *  The {@code Http2ConnectionEncoder} is expected to be an instance of {@link Http2SettingsReceivedConsumer} and
+     *  will apply the earliest received but not yet ACKed SETTINGS when writing the SETTINGS ACKs.
+     * {@code true} to enable automatically applying and sending settings acknowledge frame.
+     */
+    public DefaultHttp2ConnectionDecoder(Http2Connection connection,
+                                         Http2ConnectionEncoder encoder,
+                                         Http2FrameReader frameReader,
+                                         Http2PromisedRequestVerifier requestVerifier,
+                                         boolean autoAckSettings) {
+        if (autoAckSettings) {
+            settingsReceivedConsumer = null;
+        } else {
+            if (!(encoder instanceof Http2SettingsReceivedConsumer)) {
+                throw new IllegalArgumentException("disabling autoAckSettings requires the encoder to be a " +
+                        Http2SettingsReceivedConsumer.class);
+            }
+            settingsReceivedConsumer = (Http2SettingsReceivedConsumer) encoder;
+        }
         this.connection = checkNotNull(connection, "connection");
         this.frameReader = checkNotNull(frameReader, "frameReader");
         this.encoder = checkNotNull(encoder, "encoder");
@@ -156,12 +188,8 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
 
     void onGoAwayRead0(ChannelHandlerContext ctx, int lastStreamId, long errorCode, ByteBuf debugData)
             throws Http2Exception {
-        if (connection.goAwayReceived() && connection.local().lastStreamKnownByPeer() < lastStreamId) {
-            throw connectionError(PROTOCOL_ERROR, "lastStreamId MUST NOT increase. Current value: %d new value: %d",
-                    connection.local().lastStreamKnownByPeer(), lastStreamId);
-        }
-        listener.onGoAwayRead(ctx, lastStreamId, errorCode, debugData);
         connection.goAwayReceived(lastStreamId, errorCode, debugData);
+        listener.onGoAwayRead(ctx, lastStreamId, errorCode, debugData);
     }
 
     void onUnknownFrame0(ChannelHandlerContext ctx, byte frameType, int streamId, Http2Flags flags,
@@ -282,6 +310,14 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
                 return;
             }
 
+            boolean isInformational = !connection.isServer() &&
+                    HttpStatusClass.valueOf(headers.status()) == INFORMATIONAL;
+            if ((isInformational || !endOfStream) && stream.isHeadersReceived() || stream.isTrailersReceived()) {
+                throw streamError(streamId, PROTOCOL_ERROR,
+                                  "Stream %d received too many headers EOS: %s state: %s",
+                                  streamId, endOfStream, stream.state());
+            }
+
             switch (stream.state()) {
                 case RESERVED_REMOTE:
                     stream.open(endOfStream);
@@ -305,6 +341,7 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
                             stream.state());
             }
 
+            stream.headersReceived(isInformational);
             encoder.flowController().updateDependencyTree(streamId, streamDependency, weight, exclusive);
 
             listener.onHeadersRead(ctx, streamId, headers, streamDependency, weight, exclusive, padding, endOfStream);
@@ -401,28 +438,32 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
         }
 
         @Override
-        public void onSettingsRead(ChannelHandlerContext ctx, Http2Settings settings) throws Http2Exception {
-            // Acknowledge receipt of the settings. We should do this before we process the settings to ensure our
-            // remote peer applies these settings before any subsequent frames that we may send which depend upon these
-            // new settings. See https://github.com/netty/netty/issues/6520.
-            encoder.writeSettingsAck(ctx, ctx.newPromise());
+        public void onSettingsRead(final ChannelHandlerContext ctx, Http2Settings settings) throws Http2Exception {
+            if (settingsReceivedConsumer == null) {
+                // Acknowledge receipt of the settings. We should do this before we process the settings to ensure our
+                // remote peer applies these settings before any subsequent frames that we may send which depend upon
+                // these new settings. See https://github.com/netty/netty/issues/6520.
+                encoder.writeSettingsAck(ctx, ctx.newPromise());
 
-            encoder.remoteSettings(settings);
+                encoder.remoteSettings(settings);
+            } else {
+                settingsReceivedConsumer.consumeReceivedSettings(settings);
+            }
 
             listener.onSettingsRead(ctx, settings);
         }
 
         @Override
-        public void onPingRead(ChannelHandlerContext ctx, ByteBuf data) throws Http2Exception {
+        public void onPingRead(ChannelHandlerContext ctx, long data) throws Http2Exception {
             // Send an ack back to the remote client.
             // Need to retain the buffer here since it will be released after the write completes.
-            encoder.writePing(ctx, true, data.retainedSlice(), ctx.newPromise());
+            encoder.writePing(ctx, true, data, ctx.newPromise());
 
             listener.onPingRead(ctx, data);
         }
 
         @Override
-        public void onPingAckRead(ChannelHandlerContext ctx, ByteBuf data) throws Http2Exception {
+        public void onPingAckRead(ChannelHandlerContext ctx, long data) throws Http2Exception {
             listener.onPingAckRead(ctx, data);
         }
 
@@ -524,12 +565,18 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
                 throw streamError(streamId, STREAM_CLOSED, "Received %s frame for an unknown stream %d",
                                   frameName, streamId);
             } else if (stream.isResetSent() || streamCreatedAfterGoAwaySent(streamId)) {
+                // If we have sent a reset stream it is assumed the stream will be closed after the write completes.
+                // If we have not sent a reset, but the stream was created after a GoAway this is not supported by
+                // DefaultHttp2Connection and if a custom Http2Connection is used it is assumed the lifetime is managed
+                // elsewhere so we don't close the stream or otherwise modify the stream's state.
+
                 if (logger.isInfoEnabled()) {
-                    logger.info("{} ignoring {} frame for stream {} {}", ctx.channel(), frameName,
+                    logger.info("{} ignoring {} frame for stream {}", ctx.channel(), frameName,
                             stream.isResetSent() ? "RST_STREAM sent." :
                                 ("Stream created after GOAWAY sent. Last known stream by peer " +
                                  connection.remote().lastStreamKnownByPeer()));
                 }
+
                 return true;
             }
             return false;
@@ -625,13 +672,13 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
         }
 
         @Override
-        public void onPingRead(ChannelHandlerContext ctx, ByteBuf data) throws Http2Exception {
+        public void onPingRead(ChannelHandlerContext ctx, long data) throws Http2Exception {
             verifyPrefaceReceived();
             internalFrameListener.onPingRead(ctx, data);
         }
 
         @Override
-        public void onPingAckRead(ChannelHandlerContext ctx, ByteBuf data) throws Http2Exception {
+        public void onPingAckRead(ChannelHandlerContext ctx, long data) throws Http2Exception {
             verifyPrefaceReceived();
             internalFrameListener.onPingAckRead(ctx, data);
         }

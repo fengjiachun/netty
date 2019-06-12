@@ -18,12 +18,15 @@ package io.netty.util.internal;
 
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
+import io.netty.util.internal.logging.InternalLogger;
+import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.nio.charset.Charset;
 import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CharsetEncoder;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.WeakHashMap;
@@ -35,9 +38,24 @@ import java.util.WeakHashMap;
  */
 public final class InternalThreadLocalMap extends UnpaddedInternalThreadLocalMap {
 
+    private static final InternalLogger logger = InternalLoggerFactory.getInstance(InternalThreadLocalMap.class);
+
     private static final int DEFAULT_ARRAY_LIST_INITIAL_CAPACITY = 8;
+    private static final int STRING_BUILDER_INITIAL_SIZE;
+    private static final int STRING_BUILDER_MAX_SIZE;
 
     public static final Object UNSET = new Object();
+
+    private BitSet cleanerFlags;
+
+    static {
+        STRING_BUILDER_INITIAL_SIZE =
+                SystemPropertyUtil.getInt("io.netty.threadLocalMap.stringBuilder.initialSize", 1024);
+        logger.debug("-Dio.netty.threadLocalMap.stringBuilder.initialSize: {}", STRING_BUILDER_INITIAL_SIZE);
+
+        STRING_BUILDER_MAX_SIZE = SystemPropertyUtil.getInt("io.netty.threadLocalMap.stringBuilder.maxSize", 1024 * 4);
+        logger.debug("-Dio.netty.threadLocalMap.stringBuilder.maxSize: {}", STRING_BUILDER_MAX_SIZE);
+    }
 
     public static InternalThreadLocalMap getIfSet() {
         Thread thread = Thread.currentThread();
@@ -163,17 +181,16 @@ public final class InternalThreadLocalMap extends UnpaddedInternalThreadLocalMap
     }
 
     public StringBuilder stringBuilder() {
-        final int stringBuilderCapacity = 1024;
-        if (stringBuilder == null) {
-            stringBuilder = new StringBuilder(stringBuilderCapacity);
-        } else {
-            if (stringBuilder.capacity() > stringBuilderCapacity) {
-                stringBuilder.setLength(stringBuilderCapacity);
-                stringBuilder.trimToSize();
-            }
-            stringBuilder.setLength(0);
+        StringBuilder sb = stringBuilder;
+        if (sb == null) {
+            return stringBuilder = new StringBuilder(STRING_BUILDER_INITIAL_SIZE);
         }
-        return stringBuilder;
+        if (sb.capacity() > STRING_BUILDER_MAX_SIZE) {
+            sb.setLength(STRING_BUILDER_INITIAL_SIZE);
+            sb.trimToSize();
+        }
+        sb.setLength(0);
+        return sb;
     }
 
     public Map<Charset, CharsetEncoder> charsetEncoderCache() {
@@ -240,10 +257,12 @@ public final class InternalThreadLocalMap extends UnpaddedInternalThreadLocalMap
         return cache;
     }
 
+    @Deprecated
     public IntegerHolder counterHashCode() {
         return counterHashCode;
     }
 
+    @Deprecated
     public void setCounterHashCode(IntegerHolder counterHashCode) {
         this.counterHashCode = counterHashCode;
     }
@@ -316,5 +335,16 @@ public final class InternalThreadLocalMap extends UnpaddedInternalThreadLocalMap
     public boolean isIndexedVariableSet(int index) {
         Object[] lookup = indexedVariables;
         return index < lookup.length && lookup[index] != UNSET;
+    }
+
+    public boolean isCleanerFlagSet(int index) {
+        return cleanerFlags != null && cleanerFlags.get(index);
+    }
+
+    public void setCleanerFlag(int index) {
+        if (cleanerFlags == null) {
+            cleanerFlags = new BitSet();
+        }
+        cleanerFlags.set(index);
     }
 }

@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.locks.LockSupport;
 
+import static io.netty.util.internal.ObjectUtil.checkNotNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 /**
@@ -34,12 +35,39 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
  */
 public class LastInboundHandler extends ChannelDuplexHandler {
     private final List<Object> queue = new ArrayList<Object>();
+    private final Consumer<ChannelHandlerContext> channelReadCompleteConsumer;
     private Throwable lastException;
     private ChannelHandlerContext ctx;
     private boolean channelActive;
+    private String writabilityStates = "";
+
+    // TODO(scott): use JDK 8's Consumer
+    public interface Consumer<T> {
+        void accept(T obj);
+    }
+
+    private static final Consumer<Object> NOOP_CONSUMER = new Consumer<Object>() {
+        @Override
+        public void accept(Object obj) {
+        }
+    };
+
+    @SuppressWarnings("unchecked")
+    public static <T> Consumer<T> noopConsumer() {
+        return (Consumer<T>) NOOP_CONSUMER;
+    }
+
+    public LastInboundHandler() {
+        this(LastInboundHandler.<ChannelHandlerContext>noopConsumer());
+    }
+
+    public LastInboundHandler(Consumer<ChannelHandlerContext> channelReadCompleteConsumer) {
+        this.channelReadCompleteConsumer = checkNotNull(channelReadCompleteConsumer, "channelReadCompleteConsumer");
+    }
 
     @Override
-    public void handlerAdded(ChannelHandlerContext ctx) {
+    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+        super.handlerAdded(ctx);
         this.ctx = ctx;
     }
 
@@ -56,6 +84,10 @@ public class LastInboundHandler extends ChannelDuplexHandler {
         return channelActive;
     }
 
+    public String writabilityStates() {
+        return writabilityStates;
+    }
+
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         if (!channelActive) {
@@ -66,8 +98,23 @@ public class LastInboundHandler extends ChannelDuplexHandler {
     }
 
     @Override
+    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
+        if (writabilityStates == "") {
+            writabilityStates = String.valueOf(ctx.channel().isWritable());
+        } else {
+            writabilityStates += "," + ctx.channel().isWritable();
+        }
+        super.channelWritabilityChanged(ctx);
+    }
+
+    @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         queue.add(msg);
+    }
+
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        channelReadCompleteConsumer.accept(ctx);
     }
 
     @Override

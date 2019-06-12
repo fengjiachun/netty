@@ -18,6 +18,10 @@ package io.netty.channel;
 import java.util.ArrayList;
 import java.util.List;
 
+import static io.netty.util.internal.ObjectUtil.checkPositive;
+import static java.lang.Math.max;
+import static java.lang.Math.min;
+
 /**
  * The {@link RecvByteBufAllocator} that automatically increases and
  * decreases the predicted buffer size on feed back.
@@ -92,7 +96,7 @@ public class AdaptiveRecvByteBufAllocator extends DefaultMaxMessagesRecvByteBufA
         private int nextReceiveBufferSize;
         private boolean decreaseNow;
 
-        public HandleImpl(int minIndex, int maxIndex, int initial) {
+        HandleImpl(int minIndex, int maxIndex, int initial) {
             this.minIndex = minIndex;
             this.maxIndex = maxIndex;
 
@@ -101,21 +105,33 @@ public class AdaptiveRecvByteBufAllocator extends DefaultMaxMessagesRecvByteBufA
         }
 
         @Override
+        public void lastBytesRead(int bytes) {
+            // If we read as much as we asked for we should check if we need to ramp up the size of our next guess.
+            // This helps adjust more quickly when large amounts of data is pending and can avoid going back to
+            // the selector to check for more data. Going back to the selector can add significant latency for large
+            // data transfers.
+            if (bytes == attemptedBytesRead()) {
+                record(bytes);
+            }
+            super.lastBytesRead(bytes);
+        }
+
+        @Override
         public int guess() {
             return nextReceiveBufferSize;
         }
 
         private void record(int actualReadBytes) {
-            if (actualReadBytes <= SIZE_TABLE[Math.max(0, index - INDEX_DECREMENT - 1)]) {
+            if (actualReadBytes <= SIZE_TABLE[max(0, index - INDEX_DECREMENT - 1)]) {
                 if (decreaseNow) {
-                    index = Math.max(index - INDEX_DECREMENT, minIndex);
+                    index = max(index - INDEX_DECREMENT, minIndex);
                     nextReceiveBufferSize = SIZE_TABLE[index];
                     decreaseNow = false;
                 } else {
                     decreaseNow = true;
                 }
             } else if (actualReadBytes >= nextReceiveBufferSize) {
-                index = Math.min(index + INDEX_INCREMENT, maxIndex);
+                index = min(index + INDEX_INCREMENT, maxIndex);
                 nextReceiveBufferSize = SIZE_TABLE[index];
                 decreaseNow = false;
             }
@@ -148,9 +164,7 @@ public class AdaptiveRecvByteBufAllocator extends DefaultMaxMessagesRecvByteBufA
      * @param maximum  the inclusive upper bound of the expected buffer size
      */
     public AdaptiveRecvByteBufAllocator(int minimum, int initial, int maximum) {
-        if (minimum <= 0) {
-            throw new IllegalArgumentException("minimum: " + minimum);
-        }
+        checkPositive(minimum, "minimum");
         if (initial < minimum) {
             throw new IllegalArgumentException("initial: " + initial);
         }
@@ -179,5 +193,11 @@ public class AdaptiveRecvByteBufAllocator extends DefaultMaxMessagesRecvByteBufA
     @Override
     public Handle newHandle() {
         return new HandleImpl(minIndex, maxIndex, initial);
+    }
+
+    @Override
+    public AdaptiveRecvByteBufAllocator respectMaybeMoreData(boolean respectMaybeMoreData) {
+        super.respectMaybeMoreData(respectMaybeMoreData);
+        return this;
     }
 }

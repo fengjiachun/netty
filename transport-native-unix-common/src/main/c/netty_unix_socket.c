@@ -26,6 +26,7 @@
 #include <netinet/tcp.h>
 
 #include "netty_unix_errors.h"
+#include "netty_unix_jni.h"
 #include "netty_unix_socket.h"
 #include "netty_unix_util.h"
 
@@ -39,9 +40,7 @@ static jclass datagramSocketAddressClass = NULL;
 static jmethodID datagramSocketAddrMethodId = NULL;
 static jmethodID inetSocketAddrMethodId = NULL;
 static jclass inetSocketAddressClass = NULL;
-static jclass netUtilClass = NULL;
-static jmethodID netUtilClassIpv4PreferredMethodId = NULL;
-static int socketType;
+static int socketType = AF_INET;
 static const char* ip4prefix = "::ffff:";
 static const unsigned char wildcardAddress[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 static const unsigned char ipv4MappedWildcardAddress[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00 };
@@ -69,7 +68,7 @@ static int nettyNonBlockingSocket(int domain, int type, int protocol) {
 #endif
 }
 
-static jobject createDatagramSocketAddress(JNIEnv* env, const struct sockaddr_storage* addr, int len) {
+static jobject createDatagramSocketAddress(JNIEnv* env, const struct sockaddr_storage* addr, int len, jobject local) {
     char ipstr[INET6_ADDRSTRLEN];
     int port;
     jstring ipString;
@@ -94,7 +93,7 @@ static jobject createDatagramSocketAddress(JNIEnv* env, const struct sockaddr_st
             ipString = (*env)->NewStringUTF(env, ipstr);
         }
     }
-    jobject socketAddr = (*env)->NewObject(env, datagramSocketAddressClass, datagramSocketAddrMethodId, ipString, port, len);
+    jobject socketAddr = (*env)->NewObject(env, datagramSocketAddressClass, datagramSocketAddrMethodId, ipString, port, len, local);
     return socketAddr;
 }
 
@@ -168,55 +167,107 @@ static jbyteArray createInetSocketAddressArray(JNIEnv* env, const struct sockadd
     return bArray;
 }
 
-static int socket_type(JNIEnv* env) {
-    jboolean ipv4Preferred = (*env)->CallStaticBooleanMethod(env, netUtilClass, netUtilClassIpv4PreferredMethodId);
-
+static void netty_unix_socket_initialize(JNIEnv* env, jclass clazz, jboolean ipv4Preferred) {
     if (ipv4Preferred) {
         // User asked to use ipv4 explicitly.
-        return AF_INET;
-    }
-    int fd = nettyNonBlockingSocket(AF_INET6, SOCK_STREAM, 0);
-    if (fd == -1) {
-        if (errno == EAFNOSUPPORT) {
-            return AF_INET;
-        }
-        return AF_INET6;
+        socketType = AF_INET;
     } else {
-        close(fd);
-        return AF_INET6;
+        int fd = nettyNonBlockingSocket(AF_INET6, SOCK_STREAM, 0);
+        if (fd == -1) {
+            socketType = errno == EAFNOSUPPORT ? AF_INET : AF_INET6;
+        } else {
+            // Explicitly try to bind to ::1 to ensure IPV6 can really be used.
+            // See https://github.com/netty/netty/issues/7021.
+            struct sockaddr_in6 addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin6_family = AF_INET6;
+            addr.sin6_addr.s6_addr[15] = 1; /* [::1]:0 */
+            int res = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+
+            close(fd);
+            socketType = res == 0 ? AF_INET6 : AF_INET;
+        }
     }
 }
 
-static jint _socket(JNIEnv* env, jclass clazz, int type) {
-    int fd = nettyNonBlockingSocket(socketType, type, 0);
+static jboolean netty_unix_socket_isIPv6Preferred(JNIEnv* env, jclass clazz) {
+    return socketType == AF_INET6;
+}
+
+
+static jboolean netty_unix_socket_isIPv6(JNIEnv* env, jclass clazz, jint fd) {
+    struct sockaddr_storage addr;
+    socklen_t addrlen = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr*) &addr, &addrlen) == 0) {
+        return ((struct sockaddr*) &addr)->sa_family == AF_INET6;
+    }
+
+    netty_unix_errors_throwChannelExceptionErrorNo(env, "getsockname(...) failed: ", errno);
+    return JNI_FALSE;
+}
+
+static void netty_unix_socket_optionHandleError(JNIEnv* env, int err, char* method) {
+    if (err == EBADF) {
+        netty_unix_errors_throwClosedChannelException(env);
+    } else {
+        netty_unix_errors_throwChannelExceptionErrorNo(env, method, err);
+    }
+}
+
+static void netty_unix_socket_setOptionHandleError(JNIEnv* env, int err) {
+    netty_unix_socket_optionHandleError(env, err, "setsockopt() failed: ");
+}
+
+static int netty_unix_socket_setOption0(jint fd, int level, int optname, const void* optval, socklen_t len) {
+    return setsockopt(fd, level, optname, optval, len);
+}
+
+static jint _socket(JNIEnv* env, jclass clazz, int domain, int type) {
+    int fd = nettyNonBlockingSocket(domain, type, 0);
     if (fd == -1) {
         return -errno;
-    } else if (socketType == AF_INET6) {
-        // Allow to listen /connect ipv4 and ipv6
+    } else if (domain == AF_INET6) {
+        // Try to allow listen /connect ipv4 and ipv6
         int optval = 0;
-        if (netty_unix_socket_setOption(env, fd, IPPROTO_IPV6, IPV6_V6ONLY, &optval, sizeof(optval)) < 0) {
-            // Something went wrong so close the fd and return here. setOption(...) itself throws the exception already.
-            close(fd);
-            return -1;
+        if (netty_unix_socket_setOption0(fd, IPPROTO_IPV6, IPV6_V6ONLY, &optval, sizeof(optval)) < 0) {
+            if (errno != EAFNOSUPPORT) {
+                netty_unix_socket_setOptionHandleError(env, errno);
+                // Something went wrong so close the fd and return here. setOption(...) itself throws the exception already.
+                close(fd);
+                return -1;
+            }
+            // else we failed to enable dual stack mode.
+            // It is assumed the socket is re‐stricted to sending and receiving IPv6 packets only.
+            // Don't close fd and don't return -1. At best we can do is log.
+            // TODO: bubble this up to an actual Logger.
         }
     }
     return fd;
 }
 
-int netty_unix_socket_initSockaddr(JNIEnv* env, jbyteArray address, jint scopeId, jint jport,
+int netty_unix_socket_initSockaddr(JNIEnv* env, jboolean ipv6, jbyteArray address, jint scopeId, jint jport,
                                    const struct sockaddr_storage* addr, socklen_t* addrSize) {
     uint16_t port = htons((uint16_t) jport);
+    // We use 16 bytes as this allows us to fit ipv6, ipv4 and ipv4 mapped ipv6 addresses in the array.
+    jbyte addressBytes[16];
 
-    // Use GetPrimitiveArrayCritical and ReleasePrimitiveArrayCritical to signal the VM that we really would like
-    // to not do a memory copy here. This is ok as we not do any blocking action here anyway.
-    // This is important as the VM may suspend GC for the time!
-    jbyte* addressBytes = (*env)->GetPrimitiveArrayCritical(env, address, 0);
-    if (addressBytes == NULL) {
-        // No memory left ?!?!?
-        netty_unix_errors_throwOutOfMemoryError(env);
+    int len = (*env)->GetArrayLength(env, address);
+
+    if (len > 16) {
+        // This should never happen but let's guard against it anyway.
         return -1;
     }
-    if (socketType == AF_INET6) {
+
+    // We use GetByteArrayRegion(...) and copy into a small stack allocated buffer and NOT GetPrimitiveArrayCritical(...)
+    // as there are still multiple GCLocker related bugs which are not fixed yet.
+    //
+    // For example:
+    //     https://bugs.openjdk.java.net/browse/JDK-8048556
+    //     https://bugs.openjdk.java.net/browse/JDK-8057573
+    //     https://bugs.openjdk.java.net/browse/JDK-8057586
+    (*env)->GetByteArrayRegion(env, address, 0, len, addressBytes);
+
+    if (ipv6 == JNI_TRUE) {
         struct sockaddr_in6* ip6addr = (struct sockaddr_in6*) addr;
         *addrSize = sizeof(struct sockaddr_in6);
         ip6addr->sin6_family = AF_INET6;
@@ -236,15 +287,13 @@ int netty_unix_socket_initSockaddr(JNIEnv* env, jbyteArray address, jint scopeId
         ipaddr->sin_port = port;
         memcpy(&(ipaddr->sin_addr.s_addr), addressBytes + 12, 4);
     }
-
-    (*env)->ReleasePrimitiveArrayCritical(env, address, addressBytes, JNI_ABORT);
     return 0;
 }
 
-static jint _sendTo(JNIEnv* env, jint fd, void* buffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {
+static jint _sendTo(JNIEnv* env, jint fd, jboolean ipv6, void* buffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {
     struct sockaddr_storage addr;
     socklen_t addrSize;
-    if (netty_unix_socket_initSockaddr(env, address, scopeId, port, &addr, &addrSize) == -1) {
+    if (netty_unix_socket_initSockaddr(env, ipv6, address, scopeId, port, &addr, &addrSize) == -1) {
         return -1;
     }
 
@@ -266,9 +315,43 @@ static jobject _recvFrom(JNIEnv* env, jint fd, void* buffer, jint pos, jint limi
     socklen_t addrlen = sizeof(addr);
     ssize_t res;
     int err;
+    jobject local = NULL;
+
+#ifdef IP_RECVORIGDSTADDR
+    struct sockaddr_storage daddr;
+    struct iovec iov;
+    struct cmsghdr* cmsg;
+    struct msghdr msg;
+    char cntrlbuf[64];
+
+    int readLocalAddr;
+    if (netty_unix_socket_getOption(env, fd, IPPROTO_IP, IP_RECVORIGDSTADDR,
+            &readLocalAddr, sizeof(readLocalAddr)) < 0) {
+        readLocalAddr = 0;
+    }
+
+    if (readLocalAddr) {
+        iov.iov_base = buffer + pos;
+        iov.iov_len  = (size_t) (limit - pos);
+        msg.msg_name = (struct sockaddr*) &addr;
+        msg.msg_namelen = addrlen;
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cntrlbuf;
+        msg.msg_controllen = sizeof(cntrlbuf);
+    }
+#endif
 
     do {
-        res = recvfrom(fd, buffer + pos, (size_t) (limit - pos), 0, (struct sockaddr*) &addr, &addrlen);
+#ifdef IP_RECVORIGDSTADDR
+        if (readLocalAddr) {
+            res = recvmsg(fd, &msg, 0);
+        } else {
+#endif
+            res = recvfrom(fd, buffer + pos, (size_t) (limit - pos), 0, (struct sockaddr*) &addr, &addrlen);
+#ifdef IP_RECVORIGDSTADDR
+        }
+#endif
         // Keep on reading if we was interrupted
     } while (res == -1 && ((err = errno) == EINTR));
 
@@ -281,34 +364,33 @@ static jobject _recvFrom(JNIEnv* env, jint fd, void* buffer, jint pos, jint limi
             netty_unix_errors_throwClosedChannelException(env);
             return NULL;
         }
+        if (err == ECONNREFUSED) {
+            netty_unix_errors_throwPortUnreachableException(env, "recvfrom() failed");
+            return NULL;
+        }
         netty_unix_errors_throwIOExceptionErrorNo(env, "recvfrom() failed: ", err);
         return NULL;
     }
 
-    return createDatagramSocketAddress(env, &addr, res);
-}
-
-static void netty_unix_socket_optionHandleError(JNIEnv* env, int err, char* method) {
-    if (err == EBADF) {
-        netty_unix_errors_throwClosedChannelException(env);
-    } else {
-        netty_unix_errors_throwChannelExceptionErrorNo(env, method, err);
+#ifdef IP_RECVORIGDSTADDR
+    if (readLocalAddr) {
+        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_IP && cmsg->cmsg_type == IP_RECVORIGDSTADDR) {
+                memcpy (&daddr, CMSG_DATA(cmsg), sizeof (struct sockaddr_storage));
+                local = createDatagramSocketAddress(env, &daddr, res, NULL);
+                break;
+            }
+        }
     }
+#endif
+    return createDatagramSocketAddress(env, &addr, res, local);
 }
 
-static void netty_unix_socket_setOptionHandleError(JNIEnv* env, int err) {
-    netty_unix_socket_optionHandleError(env, err, "setsockopt() failed: ");
-}
-
-static void netty_unix_socket_getOptionHandleError(JNIEnv* env, int err) {
+void netty_unix_socket_getOptionHandleError(JNIEnv* env, int err) {
     netty_unix_socket_optionHandleError(env, err, "getsockopt() failed: ");
 }
 
-static int netty_unix_socket_setOption0(jint fd, int level, int optname, const void* optval, socklen_t len) {
-    return setsockopt(fd, level, optname, optval, len);
-}
-
-static int netty_unix_socket_getOption0(jint fd, int level, int optname, void* optval, socklen_t optlen) {
+int netty_unix_socket_getOption0(jint fd, int level, int optname, void* optval, socklen_t optlen) {
     return getsockopt(fd, level, optname, optval, &optlen);
 }
 
@@ -346,10 +428,10 @@ static jint netty_unix_socket_shutdown(JNIEnv* env, jclass clazz, jint fd, jbool
     return 0;
 }
 
-static jint netty_unix_socket_bind(JNIEnv* env, jclass clazz, jint fd, jbyteArray address, jint scopeId, jint port) {
+static jint netty_unix_socket_bind(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jbyteArray address, jint scopeId, jint port) {
     struct sockaddr_storage addr;
     socklen_t addrSize;
-    if (netty_unix_socket_initSockaddr(env, address, scopeId, port, &addr, &addrSize) == -1) {
+    if (netty_unix_socket_initSockaddr(env, ipv6, address, scopeId, port, &addr, &addrSize) == -1) {
         return -1;
     }
 
@@ -366,10 +448,10 @@ static jint netty_unix_socket_listen(JNIEnv* env, jclass clazz, jint fd, jint ba
     return 0;
 }
 
-static jint netty_unix_socket_connect(JNIEnv* env, jclass clazz, jint fd, jbyteArray address, jint scopeId, jint port) {
+static jint netty_unix_socket_connect(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jbyteArray address, jint scopeId, jint port) {
     struct sockaddr_storage addr;
     socklen_t addrSize;
-    if (netty_unix_socket_initSockaddr(env, address, scopeId, port, &addr, &addrSize) == -1) {
+    if (netty_unix_socket_initSockaddr(env, ipv6, address, scopeId, port, &addr, &addrSize) == -1) {
         // A runtime exception was thrown
         return -1;
     }
@@ -402,6 +484,38 @@ static jint netty_unix_socket_finishConnect(JNIEnv* env, jclass clazz, jint fd) 
         return 0;
     }
     return -optval;
+}
+
+static jint netty_unix_socket_disconnect(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6) {
+    struct sockaddr_storage addr;
+    int len;
+
+    memset(&addr, 0, sizeof(addr));
+
+    // You can disconnect connection-less sockets by using AF_UNSPEC.
+    // See man 2 connect.
+    if (ipv6 == JNI_TRUE) {
+        struct sockaddr_in6* ip6addr = (struct sockaddr_in6*) &addr;
+        ip6addr->sin6_family = AF_UNSPEC;
+        len = sizeof(struct sockaddr_in6);
+    } else {
+        struct sockaddr_in* ipaddr = (struct sockaddr_in*) &addr;
+        ipaddr->sin_family = AF_UNSPEC;
+        len = sizeof(struct sockaddr_in);
+    }
+
+    int res;
+    int err;
+    do {
+        res = connect(fd, (struct sockaddr*) &addr, len);
+    } while (res == -1 && ((err = errno) == EINTR));
+
+    // EAFNOSUPPORT is harmless in this case.
+    // See http://www.unix.com/man-page/osx/2/connect/
+    if (res < 0 && err != EAFNOSUPPORT) {
+        return -err;
+    }
+    return 0;
 }
 
 static jint netty_unix_socket_accept(JNIEnv* env, jclass clazz, jint fd, jbyteArray acceptedAddress) {
@@ -464,12 +578,14 @@ static jbyteArray netty_unix_socket_localAddress(JNIEnv* env, jclass clazz, jint
     return createInetSocketAddressArray(env, &addr);
 }
 
-static jint netty_unix_socket_newSocketDgramFd(JNIEnv* env, jclass clazz) {
-    return _socket(env, clazz, SOCK_DGRAM);
+static jint netty_unix_socket_newSocketDgramFd(JNIEnv* env, jclass clazz, jboolean ipv6) {
+    int domain = ipv6 == JNI_TRUE ? AF_INET6 : AF_INET;
+    return _socket(env, clazz, domain, SOCK_DGRAM);
 }
 
-static jint netty_unix_socket_newSocketStreamFd(JNIEnv* env, jclass clazz) {
-    return _socket(env, clazz, SOCK_STREAM);
+static jint netty_unix_socket_newSocketStreamFd(JNIEnv* env, jclass clazz, jboolean ipv6) {
+    int domain = ipv6 == JNI_TRUE ? AF_INET6 : AF_INET;
+    return _socket(env, clazz, domain, SOCK_STREAM);
 }
 
 static jint netty_unix_socket_newSocketDomainFd(JNIEnv* env, jclass clazz) {
@@ -480,23 +596,23 @@ static jint netty_unix_socket_newSocketDomainFd(JNIEnv* env, jclass clazz) {
     return fd;
 }
 
-static jint netty_unix_socket_sendTo(JNIEnv* env, jclass clazz, jint fd, jobject jbuffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {
+static jint netty_unix_socket_sendTo(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jobject jbuffer, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {
     // We check that GetDirectBufferAddress will not return NULL in OnLoad
-    return _sendTo(env, fd, (*env)->GetDirectBufferAddress(env, jbuffer), pos, limit, address, scopeId, port);
+    return _sendTo(env, fd, ipv6, (*env)->GetDirectBufferAddress(env, jbuffer), pos, limit, address, scopeId, port);
 }
 
-static jint netty_unix_socket_sendToAddress(JNIEnv* env, jclass clazz, jint fd, jlong memoryAddress, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {
-    return _sendTo(env, fd, (void *) (intptr_t) memoryAddress, pos, limit, address, scopeId, port);
+static jint netty_unix_socket_sendToAddress(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jlong memoryAddress, jint pos, jint limit, jbyteArray address, jint scopeId, jint port) {
+    return _sendTo(env, fd, ipv6, (void *) (intptr_t) memoryAddress, pos, limit, address, scopeId, port);
 }
 
-static jint netty_unix_socket_sendToAddresses(JNIEnv* env, jclass clazz, jint fd, jlong memoryAddress, jint length, jbyteArray address, jint scopeId, jint port) {
+static jint netty_unix_socket_sendToAddresses(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jlong memoryAddress, jint length, jbyteArray address, jint scopeId, jint port) {
     struct sockaddr_storage addr;
     socklen_t addrSize;
-    if (netty_unix_socket_initSockaddr(env, address, scopeId, port, &addr, &addrSize) == -1) {
+    if (netty_unix_socket_initSockaddr(env, ipv6, address, scopeId, port, &addr, &addrSize) == -1) {
         return -1;
     }
 
-    struct msghdr m;
+    struct msghdr m = { 0 };
     m.msg_name = (void*) &addr;
     m.msg_namelen = addrSize;
     m.msg_iov = (struct iovec*) (intptr_t) memoryAddress;
@@ -581,7 +697,7 @@ static jint netty_unix_socket_connectDomainSocket(JNIEnv* env, jclass clazz, jin
 static jint netty_unix_socket_recvFd(JNIEnv* env, jclass clazz, jint fd) {
     int socketFd;
     struct msghdr descriptorMessage = { 0 };
-    struct iovec iov[1] = { 0 };
+    struct iovec iov[1] = { { 0 } };
     char control[CMSG_SPACE(sizeof(int))] = { 0 };
     char iovecData[1];
 
@@ -629,7 +745,7 @@ static jint netty_unix_socket_recvFd(JNIEnv* env, jclass clazz, jint fd) {
 
 static jint netty_unix_socket_sendFd(JNIEnv* env, jclass clazz, jint socketFd, jint fd) {
     struct msghdr descriptorMessage = { 0 };
-    struct iovec iov[1] = { 0 };
+    struct iovec iov[1] = { { 0 } };
     char control[CMSG_SPACE(sizeof(int))] = { 0 };
     char iovecData[1];
 
@@ -702,19 +818,27 @@ static void netty_unix_socket_setSoLinger(JNIEnv* env, jclass clazz, jint fd, ji
     netty_unix_socket_setOption(env, fd, SOL_SOCKET, SO_LINGER, &solinger, sizeof(solinger));
 }
 
-static void netty_unix_socket_setTrafficClass(JNIEnv* env, jclass clazz, jint fd, jint optval) {
-    /* Try to set the ipv6 equivalent, but don't throw if this is an ipv4 only socket. */
-    int rc = netty_unix_socket_setOption0(fd, IPPROTO_IPV6, IPV6_TCLASS, &optval, sizeof(optval));
-    if (rc < 0 && errno != ENOPROTOOPT) {
-        netty_unix_socket_setOptionHandleError(env, errno);
-    }
+static void netty_unix_socket_setTrafficClass(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jint optval) {
+    if (ipv6 == JNI_TRUE) {
+        // This call will put an exception on the stack to be processed once the JNI calls completes if
+        // setsockopt failed and return a negative value.
+        int rc = netty_unix_socket_setOption(env, fd, IPPROTO_IPV6, IPV6_TCLASS, &optval, sizeof(optval));
 
-    /* Linux allows both ipv4 and ipv6 families to be set */
+        if (rc >= 0) {
+/* Linux allows both ipv4 and ipv6 families to be set */
 #ifdef __linux__
-      else {
+            // Previous call successful now try to set also for ipv4
+            if (netty_unix_socket_setOption0(fd, IPPROTO_IP, IP_TOS, &optval, sizeof(optval)) == -1) {
+                if (errno != ENOPROTOOPT) {
+                    // throw exception
+                    netty_unix_socket_setOptionHandleError(env, errno);
+                }
+            }
+#endif
+        }
+    } else {
         netty_unix_socket_setOption(env, fd, IPPROTO_IP, IP_TOS, &optval, sizeof(optval));
     }
-#endif
 }
 
 static jint netty_unix_socket_isKeepAlive(JNIEnv* env, jclass clazz, jint fd) {
@@ -761,16 +885,24 @@ static jint netty_unix_socket_getSoLinger(JNIEnv* env, jclass clazz, jint fd) {
     }
 }
 
-static jint netty_unix_socket_getTrafficClass(JNIEnv* env, jclass clazz, jint fd) {
-    /* macOS may throw an error if IPv6 is supported and it is not consulted first */
+static jint netty_unix_socket_getTrafficClass(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6) {
     int optval;
-    if (netty_unix_socket_getOption0(fd, IPPROTO_IPV6, IPV6_TCLASS, &optval, sizeof(optval)) == -1) {
-        if (errno != ENOPROTOOPT || netty_unix_socket_getOption0(fd, IPPROTO_IP, IP_TOS, &optval, sizeof(optval)) == -1) {
-            netty_unix_socket_getOptionHandleError(env, errno);
-            return -1;
+    if (ipv6 == JNI_TRUE) {
+        if (netty_unix_socket_getOption0(fd, IPPROTO_IPV6, IPV6_TCLASS, &optval, sizeof(optval)) == -1) {
+            if (errno == ENOPROTOOPT) {
+                if (netty_unix_socket_getOption(env, fd, IPPROTO_IP, IP_TOS, &optval, sizeof(optval)) == -1) {
+                    return -1;
+                }
+            } else {
+                netty_unix_socket_getOptionHandleError(env, errno);
+                return -1;
+            }
         }
+    } else {
+         if (netty_unix_socket_getOption(env, fd, IPPROTO_IP, IP_TOS, &optval, sizeof(optval)) == -1) {
+            return -1;
+         }
     }
-
     return optval;
 }
 
@@ -805,24 +937,27 @@ static jint netty_unix_socket_isBroadcast(JNIEnv* env, jclass clazz, jint fd) {
     }
     return optval;
 }
+
+
 // JNI Registered Methods End
 
 // JNI Method Registration Table Begin
 static const JNINativeMethod fixed_method_table[] = {
   { "shutdown", "(IZZ)I", (void *) netty_unix_socket_shutdown },
-  { "bind", "(I[BII)I", (void *) netty_unix_socket_bind },
+  { "bind", "(IZ[BII)I", (void *) netty_unix_socket_bind },
   { "listen", "(II)I", (void *) netty_unix_socket_listen },
-  { "connect", "(I[BII)I", (void *) netty_unix_socket_connect },
+  { "connect", "(IZ[BII)I", (void *) netty_unix_socket_connect },
   { "finishConnect", "(I)I", (void *) netty_unix_socket_finishConnect },
+  { "disconnect", "(IZ)I", (void *) netty_unix_socket_disconnect},
   { "accept", "(I[B)I", (void *) netty_unix_socket_accept },
   { "remoteAddress", "(I)[B", (void *) netty_unix_socket_remoteAddress },
   { "localAddress", "(I)[B", (void *) netty_unix_socket_localAddress },
-  { "newSocketDgramFd", "()I", (void *) netty_unix_socket_newSocketDgramFd },
-  { "newSocketStreamFd", "()I", (void *) netty_unix_socket_newSocketStreamFd },
+  { "newSocketDgramFd", "(Z)I", (void *) netty_unix_socket_newSocketDgramFd },
+  { "newSocketStreamFd", "(Z)I", (void *) netty_unix_socket_newSocketStreamFd },
   { "newSocketDomainFd", "()I", (void *) netty_unix_socket_newSocketDomainFd },
-  { "sendTo", "(ILjava/nio/ByteBuffer;II[BII)I", (void *) netty_unix_socket_sendTo },
-  { "sendToAddress", "(IJII[BII)I", (void *) netty_unix_socket_sendToAddress },
-  { "sendToAddresses", "(IJI[BII)I", (void *) netty_unix_socket_sendToAddresses },
+  { "sendTo", "(IZLjava/nio/ByteBuffer;II[BII)I", (void *) netty_unix_socket_sendTo },
+  { "sendToAddress", "(IZJII[BII)I", (void *) netty_unix_socket_sendToAddress },
+  { "sendToAddresses", "(IZJI[BII)I", (void *) netty_unix_socket_sendToAddresses },
   // "recvFrom" has a dynamic signature
   // "recvFromAddress" has a dynamic signature
   { "recvFd", "(I)I", (void *) netty_unix_socket_recvFd },
@@ -837,7 +972,7 @@ static const JNINativeMethod fixed_method_table[] = {
   { "setSendBufferSize", "(II)V", (void *) netty_unix_socket_setSendBufferSize },
   { "setKeepAlive", "(II)V", (void *) netty_unix_socket_setKeepAlive },
   { "setSoLinger", "(II)V", (void *) netty_unix_socket_setSoLinger },
-  { "setTrafficClass", "(II)V", (void *) netty_unix_socket_setTrafficClass },
+  { "setTrafficClass", "(IZI)V", (void *) netty_unix_socket_setTrafficClass },
   { "isKeepAlive", "(I)I", (void *) netty_unix_socket_isKeepAlive },
   { "isTcpNoDelay", "(I)I", (void *) netty_unix_socket_isTcpNoDelay },
   { "isBroadcast", "(I)I", (void *) netty_unix_socket_isBroadcast },
@@ -846,8 +981,11 @@ static const JNINativeMethod fixed_method_table[] = {
   { "getReceiveBufferSize", "(I)I", (void *) netty_unix_socket_getReceiveBufferSize },
   { "getSendBufferSize", "(I)I", (void *) netty_unix_socket_getSendBufferSize },
   { "getSoLinger", "(I)I", (void *) netty_unix_socket_getSoLinger },
-  { "getTrafficClass", "(I)I", (void *) netty_unix_socket_getTrafficClass },
-  { "getSoError", "(I)I", (void *) netty_unix_socket_getSoError }
+  { "getTrafficClass", "(IZ)I", (void *) netty_unix_socket_getTrafficClass },
+  { "getSoError", "(I)I", (void *) netty_unix_socket_getSoError },
+  { "initialize", "(Z)V", (void *) netty_unix_socket_initialize },
+  { "isIPv6Preferred", "()Z", (void *) netty_unix_socket_isIPv6Preferred },
+  { "isIPv6", "(I)Z", (void *) netty_unix_socket_isIPv6 }
 };
 static const jint fixed_method_table_size = sizeof(fixed_method_table) / sizeof(fixed_method_table[0]);
 
@@ -899,23 +1037,38 @@ jint netty_unix_socket_JNI_OnLoad(JNIEnv* env, const char* packagePrefix) {
     dynamicMethods = NULL;
     char* nettyClassName = netty_unix_util_prepend(packagePrefix, "io/netty/channel/unix/DatagramSocketAddress");
     jclass localDatagramSocketAddressClass = (*env)->FindClass(env, nettyClassName);
-    free(nettyClassName);
-    nettyClassName = NULL;
     if (localDatagramSocketAddressClass == NULL) {
+        free(nettyClassName);
+        nettyClassName = NULL;
         // pending exception...
         return JNI_ERR;
     }
     datagramSocketAddressClass = (jclass) (*env)->NewGlobalRef(env, localDatagramSocketAddressClass);
     if (datagramSocketAddressClass == NULL) {
+        free(nettyClassName);
+        nettyClassName = NULL;
         // out-of-memory!
         netty_unix_errors_throwOutOfMemoryError(env);
         return JNI_ERR;
     }
-    datagramSocketAddrMethodId = (*env)->GetMethodID(env, datagramSocketAddressClass, "<init>", "(Ljava/lang/String;II)V");
+
+    // Respect shading...
+    char parameters[1024] = {0};
+    snprintf(parameters, sizeof(parameters), "(Ljava/lang/String;IIL%s;)V", nettyClassName);
+
+    datagramSocketAddrMethodId = (*env)->GetMethodID(env, datagramSocketAddressClass, "<init>", parameters);
     if (datagramSocketAddrMethodId == NULL) {
-        netty_unix_errors_throwRuntimeException(env, "failed to get method ID: DatagramSocketAddress.<init>(String, int, int)");
+        char msg[1024] = {0};
+        snprintf(msg, sizeof(msg), "failed to get method ID: %s.<init>(String, int, int, %s)", nettyClassName, nettyClassName);
+        free(nettyClassName);
+        nettyClassName = NULL;
+        netty_unix_errors_throwRuntimeException(env, msg);
         return JNI_ERR;
     }
+
+    free(nettyClassName);
+    nettyClassName = NULL;
+
     jclass localInetSocketAddressClass = (*env)->FindClass(env, "java/net/InetSocketAddress");
     if (localInetSocketAddressClass == NULL) {
         // pending exception...
@@ -930,26 +1083,6 @@ jint netty_unix_socket_JNI_OnLoad(JNIEnv* env, const char* packagePrefix) {
     inetSocketAddrMethodId = (*env)->GetMethodID(env, inetSocketAddressClass, "<init>", "(Ljava/lang/String;I)V");
     if (inetSocketAddrMethodId == NULL) {
         netty_unix_errors_throwRuntimeException(env, "failed to get method ID: InetSocketAddress.<init>(String, int)");
-        return JNI_ERR;
-    }
-    nettyClassName = netty_unix_util_prepend(packagePrefix, "io/netty/util/NetUtil");
-    jclass localNetUtilClass = (*env)->FindClass(env, nettyClassName);
-    free(nettyClassName);
-    nettyClassName = NULL;
-    if (localNetUtilClass == NULL) {
-        // pending exception...
-        return JNI_ERR;
-    }
-    netUtilClass = (jclass) (*env)->NewGlobalRef(env, localNetUtilClass);
-    if (netUtilClass == NULL) {
-        // out-of-memory!
-        netty_unix_errors_throwOutOfMemoryError(env);
-        return JNI_ERR;
-    }
-    netUtilClassIpv4PreferredMethodId = (*env)->GetStaticMethodID(env, netUtilClass, "isIpV4StackPreferred", "()Z" );
-    if (netUtilClassIpv4PreferredMethodId == NULL) {
-        // position method was not found.. something is wrong so bail out
-        netty_unix_errors_throwRuntimeException(env, "failed to get method ID: NetUild.isIpV4StackPreferred()");
         return JNI_ERR;
     }
 
@@ -973,8 +1106,7 @@ jint netty_unix_socket_JNI_OnLoad(JNIEnv* env, const char* packagePrefix) {
     }
     free(mem);
 
-    socketType = socket_type(env);
-    return JNI_VERSION_1_6;
+    return NETTY_JNI_VERSION;
 }
 
 void netty_unix_socket_JNI_OnUnLoad(JNIEnv* env) {
@@ -985,9 +1117,5 @@ void netty_unix_socket_JNI_OnUnLoad(JNIEnv* env) {
     if (inetSocketAddressClass != NULL) {
         (*env)->DeleteGlobalRef(env, inetSocketAddressClass);
         inetSocketAddressClass = NULL;
-    }
-    if (netUtilClass != NULL) {
-        (*env)->DeleteGlobalRef(env, netUtilClass);
-        netUtilClass = NULL;
     }
 }

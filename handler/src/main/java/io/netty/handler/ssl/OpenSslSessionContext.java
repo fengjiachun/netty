@@ -25,6 +25,7 @@ import javax.net.ssl.SSLSessionContext;
 import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.NoSuchElementException;
+import java.util.concurrent.locks.Lock;
 
 /**
  * OpenSSL specific {@link SSLSessionContext} implementation.
@@ -33,14 +34,21 @@ public abstract class OpenSslSessionContext implements SSLSessionContext {
     private static final Enumeration<byte[]> EMPTY = new EmptyEnumeration();
 
     private final OpenSslSessionStats stats;
+
+    // The OpenSslKeyMaterialProvider is not really used by the OpenSslSessionContext but only be stored here
+    // to make it easier to destroy it later because the ReferenceCountedOpenSslContext will hold a reference
+    // to OpenSslSessionContext.
+    private final OpenSslKeyMaterialProvider provider;
+
     final ReferenceCountedOpenSslContext context;
 
     // IMPORTANT: We take the OpenSslContext and not just the long (which points the native instance) to prevent
     //            the GC to collect OpenSslContext as this would also free the pointer and so could result in a
     //            segfault when the user calls any of the methods here that try to pass the pointer down to the native
     //            level.
-    OpenSslSessionContext(ReferenceCountedOpenSslContext context) {
+    OpenSslSessionContext(ReferenceCountedOpenSslContext context, OpenSslKeyMaterialProvider provider) {
         this.context = context;
+        this.provider = provider;
         stats = new OpenSslSessionStats(context);
     }
 
@@ -76,8 +84,14 @@ public abstract class OpenSslSessionContext implements SSLSessionContext {
             a += SessionTicketKey.AES_KEY_SIZE;
             tickets[i] = new SessionTicketKey(name, hmacKey, aesKey);
         }
-        SSLContext.clearOptions(context.ctx, SSL.SSL_OP_NO_TICKET);
-        SSLContext.setSessionTicketKeys(context.ctx, tickets);
+        Lock writerLock = context.ctxLock.writeLock();
+        writerLock.lock();
+        try {
+            SSLContext.clearOptions(context.ctx, SSL.SSL_OP_NO_TICKET);
+            SSLContext.setSessionTicketKeys(context.ctx, tickets);
+        } finally {
+            writerLock.unlock();
+        }
     }
 
     /**
@@ -85,12 +99,18 @@ public abstract class OpenSslSessionContext implements SSLSessionContext {
      */
     public void setTicketKeys(OpenSslSessionTicketKey... keys) {
         ObjectUtil.checkNotNull(keys, "keys");
-        SSLContext.clearOptions(context.ctx, SSL.SSL_OP_NO_TICKET);
         SessionTicketKey[] ticketKeys = new SessionTicketKey[keys.length];
         for (int i = 0; i < ticketKeys.length; i++) {
             ticketKeys[i] = keys[i].key;
         }
-        SSLContext.setSessionTicketKeys(context.ctx, ticketKeys);
+        Lock writerLock = context.ctxLock.writeLock();
+        writerLock.lock();
+        try {
+            SSLContext.clearOptions(context.ctx, SSL.SSL_OP_NO_TICKET);
+            SSLContext.setSessionTicketKeys(context.ctx, ticketKeys);
+        } finally {
+            writerLock.unlock();
+        }
     }
 
     /**
@@ -108,6 +128,12 @@ public abstract class OpenSslSessionContext implements SSLSessionContext {
      */
     public OpenSslSessionStats stats() {
         return stats;
+    }
+
+    final void destroy() {
+        if (provider != null) {
+            provider.destroy();
+        }
     }
 
     private static final class EmptyEnumeration implements Enumeration<byte[]> {

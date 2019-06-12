@@ -19,11 +19,12 @@
 #include <errno.h>
 #include "netty_unix_util.h"
 
+static const uint64_t NETTY_BILLION = 1000000000L;
+
 #ifdef NETTY_USE_MACH_INSTEAD_OF_CLOCK
 
 #include <mach/mach.h>
 #include <mach/mach_time.h>
-static const uint64_t NETTY_BILLION = 1000000000L;
 
 #endif /* NETTY_USE_MACH_INSTEAD_OF_CLOCK */
 
@@ -51,8 +52,20 @@ char* netty_unix_util_rstrstr(char* s1rbegin, const char* s1rend, const char* s2
     return NULL;
 }
 
+static char* netty_unix_util_strstr_last(const char* haystack, const char* needle) {
+    char* prevptr = NULL;
+    char* ptr = (char*) haystack;
+
+    while ((ptr = strstr(ptr, needle)) != NULL) {
+        // Just store the ptr and continue searching.
+        prevptr = ptr;
+        ++ptr;
+    }
+    return prevptr;
+}
+
 char* netty_unix_util_parse_package_prefix(const char* libraryPathName, const char* libraryName, jint* status) {
-    char* packageNameEnd = strstr(libraryPathName, libraryName);
+    char* packageNameEnd = netty_unix_util_strstr_last(libraryPathName, libraryName);
     if (packageNameEnd == NULL) {
         *status = JNI_ERR;
         return NULL;
@@ -75,7 +88,7 @@ char* netty_unix_util_parse_package_prefix(const char* libraryPathName, const ch
     packageNameEnd = packagePrefix + packagePrefixLen;
     // Package names must be sanitized, in JNI packages names are separated by '/' characters.
     for (; temp != packageNameEnd; ++temp) {
-        if (*temp == '-') {
+        if (*temp == '_') {
             *temp = '/';
         }
     }
@@ -89,6 +102,25 @@ char* netty_unix_util_parse_package_prefix(const char* libraryPathName, const ch
 }
 
 // util methods
+uint64_t netty_unix_util_timespec_elapsed_ns(const struct timespec* begin, const struct timespec* end) {
+  return NETTY_BILLION * (end->tv_sec - begin->tv_sec) + (end->tv_nsec - begin->tv_nsec);
+}
+
+jboolean netty_unix_util_timespec_subtract_ns(struct timespec* ts, uint64_t nanos) {
+  const uint64_t seconds = nanos / NETTY_BILLION;
+  nanos -= seconds * NETTY_BILLION;
+  // If there are too many nanos we steal from seconds to avoid underflow on nanos. This way we
+  // only have to worry about underflow on tv_sec.
+  if (nanos > ts->tv_nsec) {
+    --(ts->tv_sec);
+    ts->tv_nsec += NETTY_BILLION;
+  }
+  const jboolean underflow = ts->tv_sec < seconds;
+  ts->tv_sec -= seconds;
+  ts->tv_nsec -= nanos;
+  return underflow;
+}
+
 int netty_unix_util_clock_gettime(clockid_t clockId, struct timespec* tp) {
 #ifdef NETTY_USE_MACH_INSTEAD_OF_CLOCK
   uint64_t timeNs;

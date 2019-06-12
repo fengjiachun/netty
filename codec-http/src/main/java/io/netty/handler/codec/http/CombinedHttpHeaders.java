@@ -26,8 +26,10 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
+import static io.netty.handler.codec.http.HttpHeaderNames.SET_COOKIE;
 import static io.netty.util.AsciiString.CASE_INSENSITIVE_HASHER;
 import static io.netty.util.internal.StringUtil.COMMA;
+import static io.netty.util.internal.StringUtil.unescapeCsvFields;
 
 /**
  * Will add multiple values for the same header as single header with a comma separated list of values.
@@ -77,22 +79,35 @@ public class CombinedHttpHeaders extends DefaultHttpHeaders {
             return charSequenceEscaper;
         }
 
-        public CombinedHttpHeadersImpl(HashingStrategy<CharSequence> nameHashingStrategy,
+        CombinedHttpHeadersImpl(HashingStrategy<CharSequence> nameHashingStrategy,
                 ValueConverter<CharSequence> valueConverter,
                 io.netty.handler.codec.DefaultHeaders.NameValidator<CharSequence> nameValidator) {
             super(nameHashingStrategy, valueConverter, nameValidator);
         }
 
         @Override
+        public Iterator<CharSequence> valueIterator(CharSequence name) {
+            Iterator<CharSequence> itr = super.valueIterator(name);
+            if (!itr.hasNext() || cannotBeCombined(name)) {
+                return itr;
+            }
+            Iterator<CharSequence> unescapedItr = unescapeCsvFields(itr.next()).iterator();
+            if (itr.hasNext()) {
+                throw new IllegalStateException("CombinedHttpHeaders should only have one value");
+            }
+            return unescapedItr;
+        }
+
+        @Override
         public List<CharSequence> getAll(CharSequence name) {
             List<CharSequence> values = super.getAll(name);
-            if (values.isEmpty()) {
+            if (values.isEmpty() || cannotBeCombined(name)) {
                 return values;
             }
             if (values.size() != 1) {
                 throw new IllegalStateException("CombinedHttpHeaders should only have one value");
             }
-            return StringUtil.unescapeCsvFields(values.get(0));
+            return unescapeCsvFields(values.get(0));
         }
 
         @Override
@@ -199,9 +214,13 @@ public class CombinedHttpHeaders extends DefaultHttpHeaders {
             return this;
         }
 
+        private static boolean cannotBeCombined(CharSequence name) {
+            return SET_COOKIE.contentEqualsIgnoreCase(name);
+        }
+
         private CombinedHttpHeadersImpl addEscapedValue(CharSequence name, CharSequence escapedValue) {
             CharSequence currentValue = super.get(name);
-            if (currentValue == null) {
+            if (currentValue == null || cannotBeCombined(name)) {
                 super.add(name, escapedValue);
             } else {
                 super.set(name, commaSeparateEscapedValues(currentValue, escapedValue));

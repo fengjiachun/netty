@@ -63,17 +63,23 @@ public final class AppendableCharSequence implements CharSequence, Appendable {
 
     @Override
     public AppendableCharSequence subSequence(int start, int end) {
+        if (start == end) {
+            // If start and end index is the same we need to return an empty sequence to conform to the interface.
+            // As our expanding logic depends on the fact that we have a char[] with length > 0 we need to construct
+            // an instance for which this is true.
+            return new AppendableCharSequence(Math.min(16, chars.length));
+        }
         return new AppendableCharSequence(Arrays.copyOfRange(chars, start, end));
     }
 
     @Override
     public AppendableCharSequence append(char c) {
-        try {
-            chars[pos++] = c;
-        } catch (IndexOutOfBoundsException e) {
-            expand();
-            chars[pos - 1] = c;
+        if (pos == chars.length) {
+            char[] old = chars;
+            chars = new char[old.length << 1];
+            System.arraycopy(old, 0, chars, 0, old.length);
         }
+        chars[pos++] = c;
         return this;
     }
 
@@ -137,17 +143,6 @@ public final class AppendableCharSequence implements CharSequence, Appendable {
      */
     public String subStringUnsafe(int start, int end) {
         return new String(chars, start, end - start);
-    }
-
-    private void expand() {
-        char[] old = chars;
-        // double it
-        int len = old.length << 1;
-        if (len < 0) {
-            throw new IllegalStateException();
-        }
-        chars = new char[len];
-        System.arraycopy(old, 0, chars, 0, old.length);
     }
 
     private static char[] expand(char[] array, int neededSpace, int size) {

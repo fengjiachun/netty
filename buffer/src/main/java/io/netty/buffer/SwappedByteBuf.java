@@ -152,6 +152,11 @@ public class SwappedByteBuf extends ByteBuf {
     }
 
     @Override
+    public int maxFastWritableBytes() {
+        return buf.maxFastWritableBytes();
+    }
+
+    @Override
     public boolean isReadable() {
         return buf.isReadable();
     }
@@ -995,6 +1000,11 @@ public class SwappedByteBuf extends ByteBuf {
     @Override
     public int refCnt() {
         return buf.refCnt();
+    }
+
+    @Override
+    final boolean isAccessible() {
+        return buf.isAccessible();
     }
 
     @Override

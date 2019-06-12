@@ -16,16 +16,24 @@
 
 package io.netty.util;
 
+import io.netty.util.internal.EmptyArrays;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
-import java.lang.ref.PhantomReference;
+import java.lang.ref.WeakReference;
 import java.lang.ref.ReferenceQueue;
-import java.util.ArrayDeque;
-import java.util.Deque;
+import java.lang.reflect.Method;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 import static io.netty.util.internal.StringUtil.EMPTY_STRING;
 import static io.netty.util.internal.StringUtil.NEWLINE;
@@ -37,9 +45,15 @@ public class ResourceLeakDetector<T> {
     private static final String PROP_LEVEL = "io.netty.leakDetection.level";
     private static final Level DEFAULT_LEVEL = Level.SIMPLE;
 
-    private static final String PROP_MAX_RECORDS = "io.netty.leakDetection.maxRecords";
-    private static final int DEFAULT_MAX_RECORDS = 4;
-    private static final int MAX_RECORDS;
+    private static final String PROP_TARGET_RECORDS = "io.netty.leakDetection.targetRecords";
+    private static final int DEFAULT_TARGET_RECORDS = 4;
+
+    private static final String PROP_SAMPLING_INTERVAL = "io.netty.leakDetection.samplingInterval";
+    // There is a minor performance benefit in TLR if this is a power of 2.
+    private static final int DEFAULT_SAMPLING_INTERVAL = 128;
+
+    private static final int TARGET_RECORDS;
+    static final int SAMPLING_INTERVAL;
 
     /**
      * Represents the level of resource leak detection.
@@ -107,17 +121,15 @@ public class ResourceLeakDetector<T> {
         levelStr = SystemPropertyUtil.get(PROP_LEVEL, levelStr);
         Level level = Level.parseLevel(levelStr);
 
-        MAX_RECORDS = SystemPropertyUtil.getInt(PROP_MAX_RECORDS, DEFAULT_MAX_RECORDS);
+        TARGET_RECORDS = SystemPropertyUtil.getInt(PROP_TARGET_RECORDS, DEFAULT_TARGET_RECORDS);
+        SAMPLING_INTERVAL = SystemPropertyUtil.getInt(PROP_SAMPLING_INTERVAL, DEFAULT_SAMPLING_INTERVAL);
 
         ResourceLeakDetector.level = level;
         if (logger.isDebugEnabled()) {
             logger.debug("-D{}: {}", PROP_LEVEL, level.name().toLowerCase());
-            logger.debug("-D{}: {}", PROP_MAX_RECORDS, MAX_RECORDS);
+            logger.debug("-D{}: {}", PROP_TARGET_RECORDS, TARGET_RECORDS);
         }
     }
-
-    // Should be power of two.
-    static final int DEFAULT_SAMPLING_INTERVAL = 128;
 
     /**
      * @deprecated Use {@link #setLevel(Level)} instead.
@@ -152,7 +164,8 @@ public class ResourceLeakDetector<T> {
     }
 
     /** the collection of active resources */
-    private final ConcurrentMap<DefaultResourceLeak, LeakEntry> allLeaks = PlatformDependent.newConcurrentHashMap();
+    private final Set<DefaultResourceLeak<?>> allLeaks =
+            Collections.newSetFromMap(new ConcurrentHashMap<DefaultResourceLeak<?>, Boolean>());
 
     private final ReferenceQueue<Object> refQueue = new ReferenceQueue<Object>();
     private final ConcurrentMap<String, Boolean> reportedLeaks = PlatformDependent.newConcurrentHashMap();
@@ -233,10 +246,12 @@ public class ResourceLeakDetector<T> {
      *
      * @return the {@link ResourceLeakTracker} or {@code null}
      */
+    @SuppressWarnings("unchecked")
     public final ResourceLeakTracker<T> track(T obj) {
         return track0(obj);
     }
 
+    @SuppressWarnings("unchecked")
     private DefaultResourceLeak track0(T obj) {
         Level level = ResourceLeakDetector.level;
         if (level == Level.DISABLED) {
@@ -245,27 +260,29 @@ public class ResourceLeakDetector<T> {
 
         if (level.ordinal() < Level.PARANOID.ordinal()) {
             if ((PlatformDependent.threadLocalRandom().nextInt(samplingInterval)) == 0) {
-                reportLeak(level);
-                return new DefaultResourceLeak(obj);
-            } else {
-                return null;
+                reportLeak();
+                return new DefaultResourceLeak(obj, refQueue, allLeaks);
             }
-        } else {
-            reportLeak(level);
-            return new DefaultResourceLeak(obj);
+            return null;
+        }
+        reportLeak();
+        return new DefaultResourceLeak(obj, refQueue, allLeaks);
+    }
+
+    private void clearRefQueue() {
+        for (;;) {
+            @SuppressWarnings("unchecked")
+            DefaultResourceLeak ref = (DefaultResourceLeak) refQueue.poll();
+            if (ref == null) {
+                break;
+            }
+            ref.dispose();
         }
     }
 
-    private void reportLeak(Level level) {
+    private void reportLeak() {
         if (!logger.isErrorEnabled()) {
-            for (;;) {
-                @SuppressWarnings("unchecked")
-                DefaultResourceLeak ref = (DefaultResourceLeak) refQueue.poll();
-                if (ref == null) {
-                    break;
-                }
-                ref.close();
-            }
+            clearRefQueue();
             return;
         }
 
@@ -277,9 +294,7 @@ public class ResourceLeakDetector<T> {
                 break;
             }
 
-            ref.clear();
-
-            if (!ref.close()) {
+            if (!ref.dispose()) {
                 continue;
             }
 
@@ -326,64 +341,124 @@ public class ResourceLeakDetector<T> {
     }
 
     @SuppressWarnings("deprecation")
-    private final class DefaultResourceLeak extends PhantomReference<Object> implements ResourceLeakTracker<T>,
-            ResourceLeak {
-        private final String creationRecord;
-        private final Deque<String> lastRecords = new ArrayDeque<String>();
+    private static final class DefaultResourceLeak<T>
+            extends WeakReference<Object> implements ResourceLeakTracker<T>, ResourceLeak {
+
+        @SuppressWarnings("unchecked") // generics and updaters do not mix.
+        private static final AtomicReferenceFieldUpdater<DefaultResourceLeak<?>, Record> headUpdater =
+                (AtomicReferenceFieldUpdater)
+                        AtomicReferenceFieldUpdater.newUpdater(DefaultResourceLeak.class, Record.class, "head");
+
+        @SuppressWarnings("unchecked") // generics and updaters do not mix.
+        private static final AtomicIntegerFieldUpdater<DefaultResourceLeak<?>> droppedRecordsUpdater =
+                (AtomicIntegerFieldUpdater)
+                        AtomicIntegerFieldUpdater.newUpdater(DefaultResourceLeak.class, "droppedRecords");
+
+        @SuppressWarnings("unused")
+        private volatile Record head;
+        @SuppressWarnings("unused")
+        private volatile int droppedRecords;
+
+        private final Set<DefaultResourceLeak<?>> allLeaks;
         private final int trackedHash;
 
-        private int removedRecords;
-
-        DefaultResourceLeak(Object referent) {
+        DefaultResourceLeak(
+                Object referent,
+                ReferenceQueue<Object> refQueue,
+                Set<DefaultResourceLeak<?>> allLeaks) {
             super(referent, refQueue);
 
             assert referent != null;
 
             // Store the hash of the tracked object to later assert it in the close(...) method.
             // It's important that we not store a reference to the referent as this would disallow it from
-            // be collected via the PhantomReference.
+            // be collected via the WeakReference.
             trackedHash = System.identityHashCode(referent);
-
-            Level level = getLevel();
-            if (level.ordinal() >= Level.ADVANCED.ordinal()) {
-                creationRecord = newRecord(null, 3);
-            } else {
-                creationRecord = null;
-            }
-            allLeaks.put(this, LeakEntry.INSTANCE);
+            allLeaks.add(this);
+            // Create a new Record so we always have the creation stacktrace included.
+            headUpdater.set(this, new Record(Record.BOTTOM));
+            this.allLeaks = allLeaks;
         }
 
         @Override
         public void record() {
-            record0(null, 3);
+            record0(null);
         }
 
         @Override
         public void record(Object hint) {
-            record0(hint, 3);
+            record0(hint);
         }
 
-        private void record0(Object hint, int recordsToSkip) {
-            if (creationRecord != null) {
-                String value = newRecord(hint, recordsToSkip);
-
-                synchronized (lastRecords) {
-                    int size = lastRecords.size();
-                    if (size == 0 || !lastRecords.getLast().equals(value)) {
-                        lastRecords.add(value);
+        /**
+         * This method works by exponentially backing off as more records are present in the stack. Each record has a
+         * 1 / 2^n chance of dropping the top most record and replacing it with itself. This has a number of convenient
+         * properties:
+         *
+         * <ol>
+         * <li>  The current record is always recorded. This is due to the compare and swap dropping the top most
+         *       record, rather than the to-be-pushed record.
+         * <li>  The very last access will always be recorded. This comes as a property of 1.
+         * <li>  It is possible to retain more records than the target, based upon the probability distribution.
+         * <li>  It is easy to keep a precise record of the number of elements in the stack, since each element has to
+         *     know how tall the stack is.
+         * </ol>
+         *
+         * In this particular implementation, there are also some advantages. A thread local random is used to decide
+         * if something should be recorded. This means that if there is a deterministic access pattern, it is now
+         * possible to see what other accesses occur, rather than always dropping them. Second, after
+         * {@link #TARGET_RECORDS} accesses, backoff occurs. This matches typical access patterns,
+         * where there are either a high number of accesses (i.e. a cached buffer), or low (an ephemeral buffer), but
+         * not many in between.
+         *
+         * The use of atomics avoids serializing a high number of accesses, when most of the records will be thrown
+         * away. High contention only happens when there are very few existing records, which is only likely when the
+         * object isn't shared! If this is a problem, the loop can be aborted and the record dropped, because another
+         * thread won the race.
+         */
+        private void record0(Object hint) {
+            // Check TARGET_RECORDS > 0 here to avoid similar check before remove from and add to lastRecords
+            if (TARGET_RECORDS > 0) {
+                Record oldHead;
+                Record prevHead;
+                Record newHead;
+                boolean dropped;
+                do {
+                    if ((prevHead = oldHead = headUpdater.get(this)) == null) {
+                        // already closed.
+                        return;
                     }
-                    if (size > MAX_RECORDS) {
-                        lastRecords.removeFirst();
-                        ++removedRecords;
+                    final int numElements = oldHead.pos + 1;
+                    if (numElements >= TARGET_RECORDS) {
+                        final int backOffFactor = Math.min(numElements - TARGET_RECORDS, 30);
+                        if (dropped = PlatformDependent.threadLocalRandom().nextInt(1 << backOffFactor) != 0) {
+                            prevHead = oldHead.next;
+                        }
+                    } else {
+                        dropped = false;
                     }
+                    newHead = hint != null ? new Record(prevHead, hint) : new Record(prevHead);
+                } while (!headUpdater.compareAndSet(this, oldHead, newHead));
+                if (dropped) {
+                    droppedRecordsUpdater.incrementAndGet(this);
                 }
             }
         }
 
+        boolean dispose() {
+            clear();
+            return allLeaks.remove(this);
+        }
+
         @Override
         public boolean close() {
-            // Use the ConcurrentMap remove method, which avoids allocating an iterator.
-            return allLeaks.remove(this, LeakEntry.INSTANCE);
+            if (allLeaks.remove(this)) {
+                // Call clear so the reference is not even enqueued.
+                clear();
+                headUpdater.set(this, null);
+                return true;
+            }
+            return false;
         }
 
         @Override
@@ -391,125 +466,180 @@ public class ResourceLeakDetector<T> {
             // Ensure that the object that was tracked is the same as the one that was passed to close(...).
             assert trackedHash == System.identityHashCode(trackedObject);
 
-            // We need to actually do the null check of the trackedObject after we close the leak because otherwise
-            // we may get false-positives reported by the ResourceLeakDetector. This can happen as the JIT / GC may
-            // be able to figure out that we do not need the trackedObject anymore and so already enqueue it for
-            // collection before we actually get a chance to close the enclosing ResourceLeak.
-            return close() && trackedObject != null;
+            try {
+                return close();
+            } finally {
+                // This method will do `synchronized(trackedObject)` and we should be sure this will not cause deadlock.
+                // It should not, because somewhere up the callstack should be a (successful) `trackedObject.release`,
+                // therefore it is unreasonable that anyone else, anywhere, is holding a lock on the trackedObject.
+                // (Unreasonable but possible, unfortunately.)
+                reachabilityFence0(trackedObject);
+            }
+        }
+
+         /**
+         * Ensures that the object referenced by the given reference remains
+         * <a href="package-summary.html#reachability"><em>strongly reachable</em></a>,
+         * regardless of any prior actions of the program that might otherwise cause
+         * the object to become unreachable; thus, the referenced object is not
+         * reclaimable by garbage collection at least until after the invocation of
+         * this method.
+         *
+         * <p> Recent versions of the JDK have a nasty habit of prematurely deciding objects are unreachable.
+         * see: https://stackoverflow.com/questions/26642153/finalize-called-on-strongly-reachable-object-in-java-8
+         * The Java 9 method Reference.reachabilityFence offers a solution to this problem.
+         *
+         * <p> This method is always implemented as a synchronization on {@code ref}, not as
+         * {@code Reference.reachabilityFence} for consistency across platforms and to allow building on JDK 6-8.
+         * <b>It is the caller's responsibility to ensure that this synchronization will not cause deadlock.</b>
+         *
+         * @param ref the reference. If {@code null}, this method has no effect.
+         * @see java.lang.ref.Reference#reachabilityFence
+         */
+        private static void reachabilityFence0(Object ref) {
+            if (ref != null) {
+                synchronized (ref) {
+                    // Empty synchronized is ok: https://stackoverflow.com/a/31933260/1151521
+                }
+            }
         }
 
         @Override
         public String toString() {
-            if (creationRecord == null) {
+            Record oldHead = headUpdater.getAndSet(this, null);
+            if (oldHead == null) {
+                // Already closed
                 return EMPTY_STRING;
             }
 
-            final Object[] array;
-            final int removedRecords;
-            synchronized (lastRecords) {
-                array = lastRecords.toArray();
-                removedRecords = this.removedRecords;
-            }
+            final int dropped = droppedRecordsUpdater.get(this);
+            int duped = 0;
 
-            StringBuilder buf = new StringBuilder(16384).append(NEWLINE);
-            if (removedRecords > 0) {
-                buf.append("WARNING: ")
-                .append(removedRecords)
-                .append(" leak records were discarded because the leak record count is limited to ")
-                .append(MAX_RECORDS)
-                .append(". Use system property ")
-                .append(PROP_MAX_RECORDS)
-                .append(" to increase the limit.")
-                .append(NEWLINE);
-            }
-            buf.append("Recent access records: ")
-            .append(array.length)
-            .append(NEWLINE);
+            int present = oldHead.pos + 1;
+            // Guess about 2 kilobytes per stack trace
+            StringBuilder buf = new StringBuilder(present * 2048).append(NEWLINE);
+            buf.append("Recent access records: ").append(NEWLINE);
 
-            if (array.length > 0) {
-                for (int i = array.length - 1; i >= 0; i --) {
-                    buf.append('#')
-                       .append(i + 1)
-                       .append(':')
-                       .append(NEWLINE)
-                       .append(array[i]);
+            int i = 1;
+            Set<String> seen = new HashSet<String>(present);
+            for (; oldHead != Record.BOTTOM; oldHead = oldHead.next) {
+                String s = oldHead.toString();
+                if (seen.add(s)) {
+                    if (oldHead.next == Record.BOTTOM) {
+                        buf.append("Created at:").append(NEWLINE).append(s);
+                    } else {
+                        buf.append('#').append(i++).append(':').append(NEWLINE).append(s);
+                    }
+                } else {
+                    duped++;
                 }
             }
 
-            buf.append("Created at:")
-               .append(NEWLINE)
-               .append(creationRecord);
+            if (duped > 0) {
+                buf.append(": ")
+                        .append(duped)
+                        .append(" leak records were discarded because they were duplicates")
+                        .append(NEWLINE);
+            }
+
+            if (dropped > 0) {
+                buf.append(": ")
+                   .append(dropped)
+                   .append(" leak records were discarded because the leak record count is targeted to ")
+                   .append(TARGET_RECORDS)
+                   .append(". Use system property ")
+                   .append(PROP_TARGET_RECORDS)
+                   .append(" to increase the limit.")
+                   .append(NEWLINE);
+            }
 
             buf.setLength(buf.length() - NEWLINE.length());
             return buf.toString();
         }
     }
 
-    private static final String[] STACK_TRACE_ELEMENT_EXCLUSIONS = {
-            "io.netty.util.ReferenceCountUtil.touch(",
-            "io.netty.buffer.AdvancedLeakAwareByteBuf.touch(",
-            "io.netty.buffer.AbstractByteBufAllocator.toLeakAwareBuffer(",
-            "io.netty.buffer.AdvancedLeakAwareByteBuf.recordLeakNonRefCountingOperation("
-    };
+    private static final AtomicReference<String[]> excludedMethods =
+            new AtomicReference<String[]>(EmptyArrays.EMPTY_STRINGS);
 
-    static String newRecord(Object hint, int recordsToSkip) {
-        StringBuilder buf = new StringBuilder(4096);
-
-        // Append the hint first if available.
-        if (hint != null) {
-            buf.append("\tHint: ");
-            // Prefer a hint string to a simple string form.
-            if (hint instanceof ResourceLeakHint) {
-                buf.append(((ResourceLeakHint) hint).toHintString());
-            } else {
-                buf.append(hint);
+    public static void addExclusions(Class clz, String ... methodNames) {
+        Set<String> nameSet = new HashSet<String>(Arrays.asList(methodNames));
+        // Use loop rather than lookup. This avoids knowing the parameters, and doesn't have to handle
+        // NoSuchMethodException.
+        for (Method method : clz.getDeclaredMethods()) {
+            if (nameSet.remove(method.getName()) && nameSet.isEmpty()) {
+                break;
             }
-            buf.append(NEWLINE);
+        }
+        if (!nameSet.isEmpty()) {
+            throw new IllegalArgumentException("Can't find '" + nameSet + "' in " + clz.getName());
+        }
+        String[] oldMethods;
+        String[] newMethods;
+        do {
+            oldMethods = excludedMethods.get();
+            newMethods = Arrays.copyOf(oldMethods, oldMethods.length + 2 * methodNames.length);
+            for (int i = 0; i < methodNames.length; i++) {
+                newMethods[oldMethods.length + i * 2] = clz.getName();
+                newMethods[oldMethods.length + i * 2 + 1] = methodNames[i];
+            }
+        } while (!excludedMethods.compareAndSet(oldMethods, newMethods));
+    }
+
+    private static final class Record extends Throwable {
+        private static final long serialVersionUID = 6065153674892850720L;
+
+        private static final Record BOTTOM = new Record();
+
+        private final String hintString;
+        private final Record next;
+        private final int pos;
+
+        Record(Record next, Object hint) {
+            // This needs to be generated even if toString() is never called as it may change later on.
+            hintString = hint instanceof ResourceLeakHint ? ((ResourceLeakHint) hint).toHintString() : hint.toString();
+            this.next = next;
+            this.pos = next.pos + 1;
         }
 
-        // Append the stack trace.
-        StackTraceElement[] array = new Throwable().getStackTrace();
-        for (StackTraceElement e: array) {
-            if (recordsToSkip > 0) {
-                recordsToSkip --;
-            } else {
-                String estr = e.toString();
+        Record(Record next) {
+           hintString = null;
+           this.next = next;
+           this.pos = next.pos + 1;
+        }
 
+        // Used to terminate the stack
+        private Record() {
+            hintString = null;
+            next = null;
+            pos = -1;
+        }
+
+        @Override
+        public String toString() {
+            StringBuilder buf = new StringBuilder(2048);
+            if (hintString != null) {
+                buf.append("\tHint: ").append(hintString).append(NEWLINE);
+            }
+
+            // Append the stack trace.
+            StackTraceElement[] array = getStackTrace();
+            // Skip the first three elements.
+            out: for (int i = 3; i < array.length; i++) {
+                StackTraceElement element = array[i];
                 // Strip the noisy stack trace elements.
-                boolean excluded = false;
-                for (String exclusion: STACK_TRACE_ELEMENT_EXCLUSIONS) {
-                    if (estr.startsWith(exclusion)) {
-                        excluded = true;
-                        break;
+                String[] exclusions = excludedMethods.get();
+                for (int k = 0; k < exclusions.length; k += 2) {
+                    if (exclusions[k].equals(element.getClassName())
+                            && exclusions[k + 1].equals(element.getMethodName())) {
+                        continue out;
                     }
                 }
 
-                if (!excluded) {
-                    buf.append('\t');
-                    buf.append(estr);
-                    buf.append(NEWLINE);
-                }
+                buf.append('\t');
+                buf.append(element.toString());
+                buf.append(NEWLINE);
             }
-        }
-
-        return buf.toString();
-    }
-
-    private static final class LeakEntry {
-        static final LeakEntry INSTANCE = new LeakEntry();
-        private static final int HASH = System.identityHashCode(INSTANCE);
-
-        private LeakEntry() {
-        }
-
-        @Override
-        public int hashCode() {
-            return HASH;
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            return obj == this;
+            return buf.toString();
         }
     }
 }

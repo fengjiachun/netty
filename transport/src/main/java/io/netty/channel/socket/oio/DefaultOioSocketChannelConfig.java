@@ -19,6 +19,7 @@ import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.ChannelException;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.MessageSizeEstimator;
+import io.netty.channel.PreferHeapByteBufAllocator;
 import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.socket.DefaultSocketChannelConfig;
@@ -32,15 +33,20 @@ import static io.netty.channel.ChannelOption.*;
 
 /**
  * Default {@link OioSocketChannelConfig} implementation
+ *
+ * @deprecated use NIO / EPOLL / KQUEUE transport.
  */
+@Deprecated
 public class DefaultOioSocketChannelConfig extends DefaultSocketChannelConfig implements OioSocketChannelConfig {
     @Deprecated
     public DefaultOioSocketChannelConfig(SocketChannel channel, Socket javaSocket) {
         super(channel, javaSocket);
+        setAllocator(new PreferHeapByteBufAllocator(getAllocator()));
     }
 
     DefaultOioSocketChannelConfig(OioSocketChannel channel, Socket javaSocket) {
         super(channel, javaSocket);
+        setAllocator(new PreferHeapByteBufAllocator(getAllocator()));
     }
 
     @Override

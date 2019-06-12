@@ -24,6 +24,7 @@ import static io.netty.handler.codec.http2.Http2CodecUtil.streamableBytes;
 import static io.netty.handler.codec.http2.Http2Error.INTERNAL_ERROR;
 import static io.netty.handler.codec.http2.Http2Exception.connectionError;
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
+import static io.netty.util.internal.ObjectUtil.checkPositive;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
 
@@ -72,9 +73,7 @@ public final class UniformStreamByteDistributor implements StreamByteDistributor
      * Must be > 0.
      */
     public void minAllocationChunk(int minAllocationChunk) {
-        if (minAllocationChunk <= 0) {
-            throw new IllegalArgumentException("minAllocationChunk must be > 0");
-        }
+        checkPositive(minAllocationChunk, "minAllocationChunk");
         this.minAllocationChunk = minAllocationChunk;
     }
 
@@ -127,13 +126,6 @@ public final class UniformStreamByteDistributor implements StreamByteDistributor
 
     private State state(Http2Stream stream) {
         return checkNotNull(stream, "stream").getProperty(stateKey);
-    }
-
-    /**
-     * For testing only!
-     */
-    int streamableBytes0(Http2Stream stream) {
-        return state(stream).streamableBytes;
     }
 
     /**

@@ -98,7 +98,7 @@ final class PemReader {
             throw new CertificateException("found no certificates in input stream");
         }
 
-        return certs.toArray(new ByteBuf[certs.size()]);
+        return certs.toArray(new ByteBuf[0]);
     }
 
     static ByteBuf readPrivateKey(File file) throws KeyException {
@@ -111,7 +111,7 @@ final class PemReader {
                 safeClose(in);
             }
         } catch (FileNotFoundException e) {
-            throw new KeyException("could not fine key file: " + file);
+            throw new KeyException("could not find key file: " + file);
         }
     }
 

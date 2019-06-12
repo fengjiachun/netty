@@ -19,7 +19,9 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.handler.codec.DateFormatter;
 import io.netty.handler.codec.Headers;
+import io.netty.handler.codec.HeadersUtils;
 import io.netty.util.AsciiString;
+import io.netty.util.CharsetUtil;
 
 import java.text.ParseException;
 import java.util.Calendar;
@@ -30,6 +32,9 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 
+import static io.netty.util.AsciiString.contentEquals;
+import static io.netty.util.AsciiString.contentEqualsIgnoreCase;
+import static io.netty.util.AsciiString.trim;
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
 
 /**
@@ -1145,22 +1150,15 @@ public abstract class HttpHeaders implements Iterable<Map.Entry<String, String>>
      */
     @Deprecated
     public static boolean equalsIgnoreCase(CharSequence name1, CharSequence name2) {
-        return AsciiString.contentEqualsIgnoreCase(name1, name2);
+        return contentEqualsIgnoreCase(name1, name2);
     }
 
-    static void encode(HttpHeaders headers, ByteBuf buf) throws Exception {
-        Iterator<Entry<CharSequence, CharSequence>> iter = headers.iteratorCharSequence();
-        while (iter.hasNext()) {
-            Entry<CharSequence, CharSequence> header = iter.next();
-            HttpHeadersEncoder.encoderHeader(header.getKey(), header.getValue(), buf);
-        }
-    }
-
+    @Deprecated
     public static void encodeAscii(CharSequence seq, ByteBuf buf) {
         if (seq instanceof AsciiString) {
             ByteBufUtil.copy((AsciiString) seq, 0, buf, seq.length());
         } else {
-            HttpUtil.encodeAscii0(seq, buf);
+            buf.writeCharSequence(seq, CharsetUtil.US_ASCII);
         }
     }
 
@@ -1314,6 +1312,24 @@ public abstract class HttpHeaders implements Iterable<Map.Entry<String, String>>
      * @return Iterator over the name/value header pairs.
      */
     public abstract Iterator<Entry<CharSequence, CharSequence>> iteratorCharSequence();
+
+    /**
+     * Equivalent to {@link #getAll(String)} but it is possible that no intermediate list is generated.
+     * @param name the name of the header to retrieve
+     * @return an {@link Iterator} of header values corresponding to {@code name}.
+     */
+    public Iterator<String> valueStringIterator(CharSequence name) {
+        return getAll(name).iterator();
+    }
+
+    /**
+     * Equivalent to {@link #getAll(String)} but it is possible that no intermediate list is generated.
+     * @param name the name of the header to retrieve
+     * @return an {@link Iterator} of header values corresponding to {@code name}.
+     */
+    public Iterator<? extends CharSequence> valueCharSequenceIterator(CharSequence name) {
+        return valueStringIterator(name);
+    }
 
     /**
      * Checks to see if there is a header with the specified name
@@ -1552,18 +1568,16 @@ public abstract class HttpHeaders implements Iterable<Map.Entry<String, String>>
      * @see #contains(CharSequence, CharSequence, boolean)
      */
     public boolean contains(String name, String value, boolean ignoreCase) {
-        List<String> values = getAll(name);
-        if (values.isEmpty()) {
-            return false;
-        }
-
-        for (String v: values) {
-            if (ignoreCase) {
-                if (v.equalsIgnoreCase(value)) {
+        Iterator<String> valueIterator = valueStringIterator(name);
+        if (ignoreCase) {
+            while (valueIterator.hasNext()) {
+                if (valueIterator.next().equalsIgnoreCase(value)) {
                     return true;
                 }
-            } else {
-                if (v.equals(value)) {
+            }
+        } else {
+            while (valueIterator.hasNext()) {
+                if (valueIterator.next().equals(value)) {
                     return true;
                 }
             }
@@ -1582,31 +1596,55 @@ public abstract class HttpHeaders implements Iterable<Map.Entry<String, String>>
      * otherwise a case sensitive compare is run to compare values.
      */
     public boolean containsValue(CharSequence name, CharSequence value, boolean ignoreCase) {
-        List<String> values = getAll(name);
-        if (values.isEmpty()) {
-            return false;
-        }
-
-        for (String v: values) {
-            if (contains(v, value, ignoreCase)) {
+        Iterator<? extends CharSequence> itr = valueCharSequenceIterator(name);
+        while (itr.hasNext()) {
+            if (containsCommaSeparatedTrimmed(itr.next(), value, ignoreCase)) {
                 return true;
             }
         }
         return false;
     }
 
-    private static boolean contains(String value, CharSequence expected, boolean ignoreCase) {
-        String[] parts = value.split(",");
+    private static boolean containsCommaSeparatedTrimmed(CharSequence rawNext, CharSequence expected,
+                                                         boolean ignoreCase) {
+        int begin = 0;
+        int end;
         if (ignoreCase) {
-            for (String s: parts) {
-                if (AsciiString.contentEqualsIgnoreCase(expected, s.trim())) {
+            if ((end = AsciiString.indexOf(rawNext, ',', begin)) == -1) {
+                if (contentEqualsIgnoreCase(trim(rawNext), expected)) {
                     return true;
+                }
+            } else {
+                do {
+                    if (contentEqualsIgnoreCase(trim(rawNext.subSequence(begin, end)), expected)) {
+                        return true;
+                    }
+                    begin = end + 1;
+                } while ((end = AsciiString.indexOf(rawNext, ',', begin)) != -1);
+
+                if (begin < rawNext.length()) {
+                    if (contentEqualsIgnoreCase(trim(rawNext.subSequence(begin, rawNext.length())), expected)) {
+                        return true;
+                    }
                 }
             }
         } else {
-            for (String s: parts) {
-                if (AsciiString.contentEquals(expected, s.trim())) {
+            if ((end = AsciiString.indexOf(rawNext, ',', begin)) == -1) {
+                if (contentEquals(trim(rawNext), expected)) {
                     return true;
+                }
+            } else {
+                do {
+                    if (contentEquals(trim(rawNext.subSequence(begin, end)), expected)) {
+                        return true;
+                    }
+                    begin = end + 1;
+                } while ((end = AsciiString.indexOf(rawNext, ',', begin)) != -1);
+
+                if (begin < rawNext.length()) {
+                    if (contentEquals(trim(rawNext.subSequence(begin, rawNext.length())), expected)) {
+                        return true;
+                    }
                 }
             }
         }
@@ -1649,5 +1687,17 @@ public abstract class HttpHeaders implements Iterable<Map.Entry<String, String>>
      */
     public boolean contains(CharSequence name, CharSequence value, boolean ignoreCase) {
         return contains(name.toString(), value.toString(), ignoreCase);
+    }
+
+    @Override
+    public String toString() {
+        return HeadersUtils.toString(getClass(), iteratorCharSequence(), size());
+    }
+
+    /**
+     * Returns a deep copy of the passed in {@link HttpHeaders}.
+     */
+    public HttpHeaders copy() {
+        return new DefaultHttpHeaders().set(this);
     }
 }

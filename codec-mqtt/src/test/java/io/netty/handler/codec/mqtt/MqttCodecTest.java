@@ -28,6 +28,7 @@ import org.junit.Test;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
+import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
 
@@ -56,6 +57,11 @@ public class MqttCodecTest {
     private final Channel channel = mock(Channel.class);
 
     private final MqttDecoder mqttDecoder = new MqttDecoder();
+
+    /**
+     * MqttDecoder with an unrealistic max payload size of 1 byte.
+     */
+    private final MqttDecoder mqttDecoderLimitedMessageSize = new MqttDecoder(1);
 
     @Before
     public void setup() {
@@ -116,6 +122,17 @@ public class MqttCodecTest {
             assertEquals("non-zero reserved flag", cause.getMessage());
         } finally {
             byteBuf.release();
+        }
+    }
+
+    @Test
+    public void testConnectMessageNoPassword() throws Exception {
+        final MqttConnectMessage message = createConnectMessage(MqttVersion.MQTT_3_1_1, null, PASSWORD);
+
+        try {
+            ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
+        } catch (Exception cause) {
+            assertTrue(cause instanceof DecoderException);
         }
     }
 
@@ -203,6 +220,30 @@ public class MqttCodecTest {
     }
 
     @Test
+    public void testSubAckMessageWithFailureInPayload() throws Exception {
+        MqttFixedHeader mqttFixedHeader =
+                new MqttFixedHeader(MqttMessageType.SUBACK, false, MqttQoS.AT_MOST_ONCE, false, 0);
+        MqttMessageIdVariableHeader mqttMessageIdVariableHeader = MqttMessageIdVariableHeader.from(12345);
+        MqttSubAckPayload mqttSubAckPayload = new MqttSubAckPayload(MqttQoS.FAILURE.value());
+        MqttSubAckMessage message =
+                new MqttSubAckMessage(mqttFixedHeader, mqttMessageIdVariableHeader, mqttSubAckPayload);
+
+        ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
+
+        List<Object> out = new LinkedList<Object>();
+        mqttDecoder.decode(ctx, byteBuf, out);
+
+        assertEquals("Expected one object but got " + out.size(), 1, out.size());
+
+        MqttSubAckMessage decodedMessage = (MqttSubAckMessage) out.get(0);
+        validateFixedHeaders(message.fixedHeader(), decodedMessage.fixedHeader());
+        validateMessageIdVariableHeader(message.variableHeader(), decodedMessage.variableHeader());
+        validateSubAckPayload(message.payload(), decodedMessage.payload());
+        assertEquals(1, decodedMessage.payload().grantedQoSLevels().size());
+        assertEquals(MqttQoS.FAILURE, MqttQoS.valueOf(decodedMessage.payload().grantedQoSLevels().get(0)));
+    }
+
+    @Test
     public void testUnSubscribeMessage() throws Exception {
         final MqttUnsubscribeMessage message = createUnsubscribeMessage();
         ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
@@ -236,6 +277,177 @@ public class MqttCodecTest {
     @Test
     public void testDisconnectMessage() throws Exception {
         testMessageWithOnlyFixedHeader(MqttMessageType.DISCONNECT);
+    }
+
+    @Test
+    public void testUnknownMessageType() throws Exception {
+
+        final MqttMessage message = createMessageWithFixedHeader(MqttMessageType.PINGREQ);
+        ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
+        try {
+            // setting an invalid message type (15, reserved and forbidden by MQTT 3.1.1 spec)
+            byteBuf.setByte(0, 0xF0);
+            final List<Object> out = new LinkedList<Object>();
+            mqttDecoder.decode(ctx, byteBuf, out);
+
+            assertEquals("Expected one object but got " + out.size(), 1, out.size());
+
+            final MqttMessage decodedMessage = (MqttMessage) out.get(0);
+            assertTrue(decodedMessage.decoderResult().isFailure());
+            Throwable cause = decodedMessage.decoderResult().cause();
+            assertTrue(cause instanceof IllegalArgumentException);
+            assertEquals("unknown message type: 15", cause.getMessage());
+        } finally {
+            byteBuf.release();
+        }
+    }
+
+    @Test
+    public void testConnectMessageForMqtt31TooLarge() throws Exception {
+        final MqttConnectMessage message = createConnectMessage(MqttVersion.MQTT_3_1);
+        ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
+
+        try {
+            final List<Object> out = new LinkedList<Object>();
+            mqttDecoderLimitedMessageSize.decode(ctx, byteBuf, out);
+
+            assertEquals("Expected one object but got " + out.size(), 1, out.size());
+
+            final MqttMessage decodedMessage = (MqttMessage) out.get(0);
+
+            validateFixedHeaders(message.fixedHeader(), decodedMessage.fixedHeader());
+            validateConnectVariableHeader(message.variableHeader(),
+                    (MqttConnectVariableHeader) decodedMessage.variableHeader());
+            validateDecoderExceptionTooLargeMessage(decodedMessage);
+        } finally {
+            byteBuf.release();
+        }
+    }
+
+    @Test
+    public void testConnectMessageForMqtt311TooLarge() throws Exception {
+        final MqttConnectMessage message = createConnectMessage(MqttVersion.MQTT_3_1_1);
+        ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
+
+        try {
+            final List<Object> out = new LinkedList<Object>();
+            mqttDecoderLimitedMessageSize.decode(ctx, byteBuf, out);
+
+            assertEquals("Expected one object but got " + out.size(), 1, out.size());
+
+            final MqttMessage decodedMessage = (MqttMessage) out.get(0);
+
+            validateFixedHeaders(message.fixedHeader(), decodedMessage.fixedHeader());
+            validateConnectVariableHeader(message.variableHeader(),
+                    (MqttConnectVariableHeader) decodedMessage.variableHeader());
+            validateDecoderExceptionTooLargeMessage(decodedMessage);
+        } finally {
+            byteBuf.release();
+        }
+    }
+
+    @Test
+    public void testConnAckMessageTooLarge() throws Exception {
+        final MqttConnAckMessage message = createConnAckMessage();
+        ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
+
+        try {
+            final List<Object> out = new LinkedList<Object>();
+            mqttDecoderLimitedMessageSize.decode(ctx, byteBuf, out);
+
+            assertEquals("Expected one object but got " + out.size(), 1, out.size());
+
+            final MqttMessage decodedMessage = (MqttMessage) out.get(0);
+            validateFixedHeaders(message.fixedHeader(), decodedMessage.fixedHeader());
+            validateDecoderExceptionTooLargeMessage(decodedMessage);
+        } finally {
+            byteBuf.release();
+        }
+    }
+
+    @Test
+    public void testPublishMessageTooLarge() throws Exception {
+        final MqttPublishMessage message = createPublishMessage();
+        ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
+
+        try {
+            final List<Object> out = new LinkedList<Object>();
+            mqttDecoderLimitedMessageSize.decode(ctx, byteBuf, out);
+
+            assertEquals("Expected one object but got " + out.size(), 1, out.size());
+
+            final MqttMessage decodedMessage = (MqttMessage) out.get(0);
+
+            validateFixedHeaders(message.fixedHeader(), decodedMessage.fixedHeader());
+            validatePublishVariableHeader(message.variableHeader(),
+                    (MqttPublishVariableHeader) decodedMessage.variableHeader());
+            validateDecoderExceptionTooLargeMessage(decodedMessage);
+        } finally {
+            byteBuf.release();
+        }
+    }
+
+    @Test
+    public void testSubscribeMessageTooLarge() throws Exception {
+        final MqttSubscribeMessage message = createSubscribeMessage();
+        ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
+
+        try {
+            final List<Object> out = new LinkedList<Object>();
+            mqttDecoderLimitedMessageSize.decode(ctx, byteBuf, out);
+
+            assertEquals("Expected one object but got " + out.size(), 1, out.size());
+
+            final MqttMessage decodedMessage = (MqttMessage) out.get(0);
+            validateFixedHeaders(message.fixedHeader(), decodedMessage.fixedHeader());
+            validateMessageIdVariableHeader(message.variableHeader(),
+                    (MqttMessageIdVariableHeader) decodedMessage.variableHeader());
+            validateDecoderExceptionTooLargeMessage(decodedMessage);
+        } finally {
+            byteBuf.release();
+        }
+    }
+
+    @Test
+    public void testSubAckMessageTooLarge() throws Exception {
+        final MqttSubAckMessage message = createSubAckMessage();
+        ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
+
+        try {
+            final List<Object> out = new LinkedList<Object>();
+            mqttDecoderLimitedMessageSize.decode(ctx, byteBuf, out);
+
+            assertEquals("Expected one object but got " + out.size(), 1, out.size());
+
+            final MqttMessage decodedMessage = (MqttMessage) out.get(0);
+            validateFixedHeaders(message.fixedHeader(), decodedMessage.fixedHeader());
+            validateMessageIdVariableHeader(message.variableHeader(),
+                    (MqttMessageIdVariableHeader) decodedMessage.variableHeader());
+            validateDecoderExceptionTooLargeMessage(decodedMessage);
+        } finally {
+            byteBuf.release();
+        }
+    }
+
+    @Test
+    public void testUnSubscribeMessageTooLarge() throws Exception {
+        final MqttUnsubscribeMessage message = createUnsubscribeMessage();
+        ByteBuf byteBuf = MqttEncoder.doEncode(ALLOCATOR, message);
+
+        try {
+            final List<Object> out = new LinkedList<Object>();
+            mqttDecoderLimitedMessageSize.decode(ctx, byteBuf, out);
+
+            assertEquals("Expected one object but got " + out.size(), 1, out.size());
+
+            final MqttMessage decodedMessage = (MqttMessage) out.get(0);
+            validateFixedHeaders(message.fixedHeader(), decodedMessage.fixedHeader());
+            validateMessageIdVariableHeader(message.variableHeader(),
+                    (MqttMessageIdVariableHeader) decodedMessage.variableHeader());
+            validateDecoderExceptionTooLargeMessage(decodedMessage);
+        } finally {
+            byteBuf.release();
+        }
     }
 
     private void testMessageWithOnlyFixedHeader(MqttMessageType messageType) throws Exception {
@@ -281,7 +493,7 @@ public class MqttCodecTest {
                 new MqttFixedHeader(
                         messageType,
                         false,
-                        messageType == MqttMessageType.PUBREL ? MqttQoS.AT_LEAST_ONCE :  MqttQoS.AT_MOST_ONCE,
+                        messageType == MqttMessageType.PUBREL ? MqttQoS.AT_LEAST_ONCE : MqttQoS.AT_MOST_ONCE,
                         false,
                         0);
         MqttMessageIdVariableHeader mqttMessageIdVariableHeader = MqttMessageIdVariableHeader.from(12345);
@@ -289,11 +501,15 @@ public class MqttCodecTest {
     }
 
     private static MqttConnectMessage createConnectMessage(MqttVersion mqttVersion) {
+        return createConnectMessage(mqttVersion, USER_NAME, PASSWORD);
+    }
+
+    private static MqttConnectMessage createConnectMessage(MqttVersion mqttVersion, String username, String password) {
         return MqttMessageBuilders.connect()
                 .clientId(CLIENT_ID)
                 .protocolVersion(mqttVersion)
-                .username(USER_NAME)
-                .password(PASSWORD)
+                .username(username)
+                .password(password)
                 .willRetain(true)
                 .willQoS(MqttQoS.AT_LEAST_ONCE)
                 .willFlag(true)
@@ -315,7 +531,7 @@ public class MqttCodecTest {
         MqttFixedHeader mqttFixedHeader =
                 new MqttFixedHeader(MqttMessageType.PUBLISH, false, MqttQoS.AT_LEAST_ONCE, true, 0);
         MqttPublishVariableHeader mqttPublishVariableHeader = new MqttPublishVariableHeader("/abc", 1234);
-        ByteBuf payload =  ALLOCATOR.buffer();
+        ByteBuf payload = ALLOCATOR.buffer();
         payload.writeBytes("whatever".getBytes(CharsetUtil.UTF_8));
         return new MqttPublishMessage(mqttFixedHeader, mqttPublishVariableHeader, payload);
     }
@@ -395,7 +611,13 @@ public class MqttCodecTest {
                 actual.clientIdentifier());
         assertEquals("MqttConnectPayload UserName mismatch ", expected.userName(), actual.userName());
         assertEquals("MqttConnectPayload Password mismatch ", expected.password(), actual.password());
+        assertTrue(
+                "MqttConnectPayload Password bytes mismatch ",
+                Arrays.equals(expected.passwordInBytes(), actual.passwordInBytes()));
         assertEquals("MqttConnectPayload WillMessage mismatch ", expected.willMessage(), actual.willMessage());
+        assertTrue(
+                "MqttConnectPayload WillMessage bytes mismatch ",
+                Arrays.equals(expected.willMessageInBytes(), actual.willMessageInBytes()));
         assertEquals("MqttConnectPayload WillTopic mismatch ", expected.willTopic(), actual.willTopic());
     }
 
@@ -460,5 +682,15 @@ public class MqttCodecTest {
                 "MqttUnsubscribePayload TopicList mismatch ",
                 expected.topics().toArray(),
                 actual.topics().toArray());
+    }
+
+    private static void validateDecoderExceptionTooLargeMessage(MqttMessage message) {
+        assertNull("MqttMessage payload expected null ", message.payload());
+        assertTrue(message.decoderResult().isFailure());
+        Throwable cause = message.decoderResult().cause();
+        assertTrue("MqttMessage DecoderResult cause expected instance of DecoderException ",
+                cause instanceof DecoderException);
+        assertTrue("MqttMessage DecoderResult cause reason expect to contain 'too large message' ",
+                cause.getMessage().contains("too large message:"));
     }
 }
