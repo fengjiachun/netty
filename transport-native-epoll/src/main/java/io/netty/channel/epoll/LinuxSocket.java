@@ -17,7 +17,6 @@ package io.netty.channel.epoll;
 
 import io.netty.channel.ChannelException;
 import io.netty.channel.DefaultFileRegion;
-import io.netty.channel.socket.DatagramChannelConfig;
 import io.netty.channel.unix.NativeInetAddress;
 import io.netty.channel.unix.PeerCredentials;
 import io.netty.channel.unix.Socket;
@@ -53,6 +52,11 @@ final class LinuxSocket extends Socket {
     int sendmmsg(NativeDatagramPacketArray.NativeDatagramPacket[] msgs,
                                int offset, int len) throws IOException {
         return Native.sendmmsg(intValue(), ipv6, msgs, offset, len);
+    }
+
+    int recvmmsg(NativeDatagramPacketArray.NativeDatagramPacket[] msgs,
+                 int offset, int len) throws IOException {
+        return Native.recvmmsg(intValue(), ipv6, msgs, offset, len);
     }
 
     void setTimeToLive(int ttl) throws IOException {

@@ -272,7 +272,7 @@ public class HttpContentCompressorTest {
         assertEncodedResponse(ch);
 
         ch.writeOutbound(LastHttpContent.EMPTY_LAST_CONTENT);
-        HttpContent chunk = (HttpContent) ch.readOutbound();
+        HttpContent chunk = ch.readOutbound();
         assertThat(ByteBufUtil.hexDump(chunk.content()), is("1f8b080000000000000003000000000000000000"));
         assertThat(chunk, is(instanceOf(HttpContent.class)));
         chunk.release();
@@ -423,7 +423,7 @@ public class HttpContentCompressorTest {
         res.headers().set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.IDENTITY);
         assertTrue(ch.writeOutbound(res));
 
-        FullHttpResponse response = (FullHttpResponse) ch.readOutbound();
+        FullHttpResponse response = ch.readOutbound();
         assertEquals(String.valueOf(len), response.headers().get(HttpHeaderNames.CONTENT_LENGTH));
         assertEquals(HttpHeaderValues.IDENTITY.toString(), response.headers().get(HttpHeaderNames.CONTENT_ENCODING));
         assertEquals("Hello, World", response.content().toString(CharsetUtil.US_ASCII));
@@ -445,7 +445,7 @@ public class HttpContentCompressorTest {
         res.headers().set(HttpHeaderNames.CONTENT_ENCODING, "ascii");
         assertTrue(ch.writeOutbound(res));
 
-        FullHttpResponse response = (FullHttpResponse) ch.readOutbound();
+        FullHttpResponse response = ch.readOutbound();
         assertEquals(String.valueOf(len), response.headers().get(HttpHeaderNames.CONTENT_LENGTH));
         assertEquals("ascii", response.headers().get(HttpHeaderNames.CONTENT_ENCODING));
         assertEquals("Hello, World", response.content().toString(CharsetUtil.US_ASCII));
@@ -497,6 +497,39 @@ public class HttpContentCompressorTest {
         assertTrue(ch.writeOutbound(res1024));
         DefaultHttpResponse response1024 = ch.readOutbound();
         assertThat(response1024.headers().get(HttpHeaderNames.CONTENT_ENCODING), is("gzip"));
+        assertTrue(ch.finishAndReleaseAll());
+    }
+
+    @Test
+    public void testMultipleAcceptEncodingHeaders() {
+        FullHttpRequest request = newRequest();
+        request.headers().set(HttpHeaderNames.ACCEPT_ENCODING, "unknown; q=1.0")
+               .add(HttpHeaderNames.ACCEPT_ENCODING, "gzip; q=0.5")
+               .add(HttpHeaderNames.ACCEPT_ENCODING, "deflate; q=0");
+
+        EmbeddedChannel ch = new EmbeddedChannel(new HttpContentCompressor());
+
+        assertTrue(ch.writeInbound(request));
+
+        FullHttpResponse res = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1, HttpResponseStatus.OK,
+                Unpooled.copiedBuffer("Gzip Win", CharsetUtil.US_ASCII));
+        assertTrue(ch.writeOutbound(res));
+
+        assertEncodedResponse(ch);
+        HttpContent c = ch.readOutbound();
+        assertThat(ByteBufUtil.hexDump(c.content()), is("1f8b080000000000000072afca2c5008cfcc03000000ffff"));
+        c.release();
+
+        c = ch.readOutbound();
+        assertThat(ByteBufUtil.hexDump(c.content()), is("03001f2ebf0f08000000"));
+        c.release();
+
+        LastHttpContent last = ch.readOutbound();
+        assertThat(last.content().readableBytes(), is(0));
+        last.release();
+
+        assertThat(ch.readOutbound(), is(nullValue()));
         assertTrue(ch.finishAndReleaseAll());
     }
 

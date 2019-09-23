@@ -15,6 +15,7 @@
  */
 package io.netty.handler.codec.http.websocketx;
 
+import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
@@ -213,7 +214,8 @@ public class WebSocketClientHandshaker08 extends WebSocketClientHandshaker {
         }
 
         // Format request
-        FullHttpRequest request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, upgradeUrl(wsURL));
+        FullHttpRequest request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, upgradeUrl(wsURL),
+                Unpooled.EMPTY_BUFFER);
         HttpHeaders headers = request.headers();
 
         if (customHeaders != null) {
@@ -223,8 +225,11 @@ public class WebSocketClientHandshaker08 extends WebSocketClientHandshaker {
         headers.set(HttpHeaderNames.UPGRADE, HttpHeaderValues.WEBSOCKET)
                .set(HttpHeaderNames.CONNECTION, HttpHeaderValues.UPGRADE)
                .set(HttpHeaderNames.SEC_WEBSOCKET_KEY, key)
-               .set(HttpHeaderNames.HOST, websocketHostValue(wsURL))
-               .set(HttpHeaderNames.SEC_WEBSOCKET_ORIGIN, websocketOriginValue(wsURL));
+               .set(HttpHeaderNames.HOST, websocketHostValue(wsURL));
+
+        if (!headers.contains(HttpHeaderNames.SEC_WEBSOCKET_ORIGIN)) {
+            headers.set(HttpHeaderNames.SEC_WEBSOCKET_ORIGIN, websocketOriginValue(wsURL));
+        }
 
         String expectedSubprotocol = expectedSubprotocol();
         if (expectedSubprotocol != null && !expectedSubprotocol.isEmpty()) {

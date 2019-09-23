@@ -42,8 +42,6 @@ import java.net.PortUnreachableException;
 import java.net.SocketAddress;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.List;
 
 import static io.netty.channel.kqueue.BsdSocket.newSocketDgram;
 
@@ -325,7 +323,7 @@ public final class KQueueDatagramChannel extends AbstractKQueueChannel implement
             }
         } else if (data.nioBufferCount() > 1) {
             IovArray array = ((KQueueEventLoop) eventLoop()).cleanArray();
-            array.add(data);
+            array.add(data, data.readerIndex(), data.readableBytes());
             int cnt = array.count();
             assert cnt != 0;
 
@@ -388,6 +386,7 @@ public final class KQueueDatagramChannel extends AbstractKQueueChannel implement
     protected void doDisconnect() throws Exception {
         socket.disconnect();
         connected = active = false;
+        resetCachedAddresses();
     }
 
     @Override

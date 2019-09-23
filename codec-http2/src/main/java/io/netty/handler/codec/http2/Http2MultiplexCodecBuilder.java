@@ -23,7 +23,10 @@ import static io.netty.util.internal.ObjectUtil.checkNotNull;
 
 /**
  * A builder for {@link Http2MultiplexCodec}.
+ *
+ * @deprecated use {@link Http2FrameCodecBuilder} together with {@link Http2MultiplexHandler}.
  */
+@Deprecated
 @UnstableApi
 public class Http2MultiplexCodecBuilder
         extends AbstractHttp2ConnectionHandlerBuilder<Http2MultiplexCodec, Http2MultiplexCodecBuilder> {
@@ -147,6 +150,16 @@ public class Http2MultiplexCodecBuilder
     }
 
     @Override
+    public int encoderEnforceMaxQueuedControlFrames() {
+        return super.encoderEnforceMaxQueuedControlFrames();
+    }
+
+    @Override
+    public Http2MultiplexCodecBuilder encoderEnforceMaxQueuedControlFrames(int maxQueuedControlFrames) {
+        return super.encoderEnforceMaxQueuedControlFrames(maxQueuedControlFrames);
+    }
+
+    @Override
     public Http2HeadersEncoder.SensitivityDetector headerSensitivityDetector() {
         return super.headerSensitivityDetector();
     }
@@ -163,6 +176,7 @@ public class Http2MultiplexCodecBuilder
     }
 
     @Override
+    @Deprecated
     public Http2MultiplexCodecBuilder initialHuffmanDecodeCapacity(int initialHuffmanDecodeCapacity) {
         return super.initialHuffmanDecodeCapacity(initialHuffmanDecodeCapacity);
     }
@@ -173,8 +187,23 @@ public class Http2MultiplexCodecBuilder
     }
 
     @Override
+    public Http2MultiplexCodecBuilder autoAckPingFrame(boolean autoAckPingFrame) {
+        return super.autoAckPingFrame(autoAckPingFrame);
+    }
+
+    @Override
     public Http2MultiplexCodecBuilder decoupleCloseAndGoAway(boolean decoupleCloseAndGoAway) {
         return super.decoupleCloseAndGoAway(decoupleCloseAndGoAway);
+    }
+
+    @Override
+    public int decoderEnforceMaxConsecutiveEmptyDataFrames() {
+        return super.decoderEnforceMaxConsecutiveEmptyDataFrames();
+    }
+
+    @Override
+    public Http2MultiplexCodecBuilder decoderEnforceMaxConsecutiveEmptyDataFrames(int maxConsecutiveEmptyFrames) {
+        return super.decoderEnforceMaxConsecutiveEmptyDataFrames(maxConsecutiveEmptyFrames);
     }
 
     @Override
@@ -198,7 +227,12 @@ public class Http2MultiplexCodecBuilder
                 encoder = new StreamBufferingEncoder(encoder);
             }
             Http2ConnectionDecoder decoder = new DefaultHttp2ConnectionDecoder(connection, encoder, frameReader,
-                    promisedRequestVerifier(), isAutoAckSettingsFrame());
+                    promisedRequestVerifier(), isAutoAckSettingsFrame(), isAutoAckPingFrame());
+
+            int maxConsecutiveEmptyDataFrames = decoderEnforceMaxConsecutiveEmptyDataFrames();
+            if (maxConsecutiveEmptyDataFrames > 0) {
+                decoder = new Http2EmptyDataFrameConnectionDecoder(decoder, maxConsecutiveEmptyDataFrames);
+            }
 
             return build(decoder, encoder, initialSettings());
         }

@@ -31,6 +31,7 @@ import io.netty.channel.ChannelPromise;
 import io.netty.channel.EventLoop;
 import io.netty.channel.FixedRecvByteBufAllocator;
 import io.netty.channel.socket.DatagramChannel;
+import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.socket.InternetProtocolFamily;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.handler.codec.dns.DatagramDnsQueryEncoder;
@@ -176,17 +177,40 @@ public class DnsNameResolver extends InetNameResolver {
 
     @SuppressWarnings("unchecked")
     private static List<String> getSearchDomainsHack() throws Exception {
-        // This code on Java 9+ yields a warning about illegal reflective access that will be denied in
-        // a future release. There doesn't seem to be a better way to get search domains for Windows yet.
-        Class<?> configClass = Class.forName("sun.net.dns.ResolverConfiguration");
-        Method open = configClass.getMethod("open");
-        Method nameservers = configClass.getMethod("searchlist");
-        Object instance = open.invoke(null);
+        // Only try if not using Java9 and later
+        // See https://github.com/netty/netty/issues/9500
+        if (PlatformDependent.javaVersion() < 9) {
+            // This code on Java 9+ yields a warning about illegal reflective access that will be denied in
+            // a future release. There doesn't seem to be a better way to get search domains for Windows yet.
+            Class<?> configClass = Class.forName("sun.net.dns.ResolverConfiguration");
+            Method open = configClass.getMethod("open");
+            Method nameservers = configClass.getMethod("searchlist");
+            Object instance = open.invoke(null);
 
-        return (List<String>) nameservers.invoke(instance);
+            return (List<String>) nameservers.invoke(instance);
+        }
+        return Collections.emptyList();
     }
 
-    private static final DatagramDnsResponseDecoder DATAGRAM_DECODER = new DatagramDnsResponseDecoder();
+    private static final DatagramDnsResponseDecoder DATAGRAM_DECODER = new DatagramDnsResponseDecoder() {
+        @Override
+        protected DnsResponse decodeResponse(ChannelHandlerContext ctx, DatagramPacket packet) throws Exception {
+            DnsResponse response = super.decodeResponse(ctx, packet);
+            if (packet.content().isReadable()) {
+                // If there is still something to read we did stop parsing because of a truncated message.
+                // This can happen if we enabled EDNS0 but our MTU is not big enough to handle all the
+                // data.
+                response.setTruncated(true);
+
+                if (logger.isDebugEnabled()) {
+                    logger.debug(
+                            "{} RECEIVED: UDP truncated packet received, consider adjusting maxPayloadSize for the {}.",
+                            ctx.channel(), StringUtil.simpleClassName(DnsNameResolver.class));
+                }
+            }
+            return response;
+        }
+    };
     private static final DatagramDnsQueryEncoder DATAGRAM_ENCODER = new DatagramDnsQueryEncoder();
     private static final TcpDnsQueryEncoder TCP_ENCODER = new TcpDnsQueryEncoder();
 

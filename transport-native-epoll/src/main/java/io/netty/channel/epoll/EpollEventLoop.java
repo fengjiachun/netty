@@ -17,6 +17,7 @@ package io.netty.channel.epoll;
 
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.EventLoopTaskQueueFactory;
 import io.netty.channel.SelectStrategy;
 import io.netty.channel.SingleThreadEventLoop;
 import io.netty.channel.epoll.AbstractEpollChannel.AbstractEpollUnsafe;
@@ -32,6 +33,7 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.io.IOException;
+import java.util.BitSet;
 import java.util.Queue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
@@ -58,6 +60,8 @@ class EpollEventLoop extends SingleThreadEventLoop {
     private final FileDescriptor eventFd;
     private final FileDescriptor timerFd;
     private final IntObjectMap<AbstractEpollChannel> channels = new IntObjectHashMap<AbstractEpollChannel>(4096);
+    private final BitSet pendingFlagChannels = new BitSet();
+
     private final boolean allowGrowing;
     private final EpollEventArray events;
 
@@ -80,8 +84,10 @@ class EpollEventLoop extends SingleThreadEventLoop {
     private static final long MAX_SCHEDULED_TIMERFD_NS = 999999999;
 
     EpollEventLoop(EventLoopGroup parent, Executor executor, int maxEvents,
-                   SelectStrategy strategy, RejectedExecutionHandler rejectedExecutionHandler) {
-        super(parent, executor, false, DEFAULT_MAX_PENDING_TASKS, rejectedExecutionHandler);
+                   SelectStrategy strategy, RejectedExecutionHandler rejectedExecutionHandler,
+                   EventLoopTaskQueueFactory queueFactory) {
+        super(parent, executor, false, newTaskQueue(queueFactory), newTaskQueue(queueFactory),
+                rejectedExecutionHandler);
         selectStrategy = ObjectUtil.checkNotNull(strategy, "strategy");
         if (maxEvents == 0) {
             allowGrowing = true;
@@ -140,6 +146,14 @@ class EpollEventLoop extends SingleThreadEventLoop {
         }
     }
 
+    private static Queue<Runnable> newTaskQueue(
+            EventLoopTaskQueueFactory queueFactory) {
+        if (queueFactory == null) {
+            return newTaskQueue0(DEFAULT_MAX_PENDING_TASKS);
+        }
+        return queueFactory.newTaskQueue(DEFAULT_MAX_PENDING_TASKS);
+    }
+
     /**
      * Return a cleared {@link IovArray} that can be used for writes in this {@link EventLoop}.
      */
@@ -179,6 +193,7 @@ class EpollEventLoop extends SingleThreadEventLoop {
         assert inEventLoop();
         int fd = ch.socket.intValue();
         Native.epollCtlAdd(epollFd.intValue(), fd, ch.flags);
+        ch.activeFlags = ch.flags;
         AbstractEpollChannel old = channels.put(fd, ch);
 
         // We either expect to have no Channel in the map with the same FD or that the FD of the old Channel is already
@@ -192,6 +207,28 @@ class EpollEventLoop extends SingleThreadEventLoop {
     void modify(AbstractEpollChannel ch) throws IOException {
         assert inEventLoop();
         Native.epollCtlMod(epollFd.intValue(), ch.socket.intValue(), ch.flags);
+        ch.activeFlags = ch.flags;
+    }
+
+    void updatePendingFlagsSet(AbstractEpollChannel ch) {
+        pendingFlagChannels.set(ch.socket.intValue(), ch.flags != ch.activeFlags);
+    }
+
+    private void processPendingChannelFlags() {
+        // Call epollCtlMod for any channels that require event interest changes before epollWaiting
+        if (!pendingFlagChannels.isEmpty()) {
+            for (int fd = 0; (fd = pendingFlagChannels.nextSetBit(fd)) >= 0; pendingFlagChannels.clear(fd)) {
+                AbstractEpollChannel ch = channels.get(fd);
+                if (ch != null) {
+                    try {
+                        ch.modifyEvents();
+                    } catch (IOException e) {
+                        ch.pipeline().fireExceptionCaught(e);
+                        ch.close();
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -208,18 +245,26 @@ class EpollEventLoop extends SingleThreadEventLoop {
 
             // If we found another Channel in the map that is mapped to the same FD the given Channel MUST be closed.
             assert !ch.isOpen();
-        } else if (ch.isOpen()) {
-            // Remove the epoll. This is only needed if it's still open as otherwise it will be automatically
-            // removed once the file-descriptor is closed.
-            Native.epollCtlDel(epollFd.intValue(), fd);
+        } else {
+            ch.activeFlags = 0;
+            pendingFlagChannels.clear(fd);
+            if (ch.isOpen()) {
+                // Remove the epoll. This is only needed if it's still open as otherwise it will be automatically
+                // removed once the file-descriptor is closed.
+                Native.epollCtlDel(epollFd.intValue(), fd);
+            }
         }
     }
 
     @Override
     protected Queue<Runnable> newTaskQueue(int maxPendingTasks) {
+        return newTaskQueue0(maxPendingTasks);
+    }
+
+    private static Queue<Runnable> newTaskQueue0(int maxPendingTasks) {
         // This event loop never calls takeTask()
         return maxPendingTasks == Integer.MAX_VALUE ? PlatformDependent.<Runnable>newMpscQueue()
-                                                    : PlatformDependent.<Runnable>newMpscQueue(maxPendingTasks);
+                : PlatformDependent.<Runnable>newMpscQueue(maxPendingTasks);
     }
 
     /**
@@ -273,6 +318,7 @@ class EpollEventLoop extends SingleThreadEventLoop {
     protected void run() {
         for (;;) {
             try {
+                processPendingChannelFlags();
                 int strategy = selectStrategy.calculateStrategy(selectNowSupplier, hasTasks());
                 switch (strategy) {
                     case SelectStrategy.CONTINUE:

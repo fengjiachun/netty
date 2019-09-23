@@ -239,7 +239,7 @@ public final class ReferenceCountedOpenSslClientContext extends ReferenceCounted
 
         ExtendedTrustManagerVerifyCallback(OpenSslEngineMap engineMap, X509ExtendedTrustManager manager) {
             super(engineMap);
-            this.manager = OpenSslTlsv13X509ExtendedTrustManager.wrap(manager, true);
+            this.manager = OpenSslTlsv13X509ExtendedTrustManager.wrap(manager);
         }
 
         @Override
@@ -261,6 +261,10 @@ public final class ReferenceCountedOpenSslClientContext extends ReferenceCounted
         @Override
         public void handle(long ssl, byte[] keyTypeBytes, byte[][] asn1DerEncodedPrincipals) throws Exception {
             final ReferenceCountedOpenSslEngine engine = engineMap.get(ssl);
+            // May be null if it was destroyed in the meantime.
+            if (engine == null) {
+                return;
+            }
             try {
                 final Set<String> keyTypesSet = supportedClientKeyTypes(keyTypeBytes);
                 final String[] keyTypes = keyTypesSet.toArray(new String[0]);

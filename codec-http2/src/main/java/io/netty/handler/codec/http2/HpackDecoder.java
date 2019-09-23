@@ -89,8 +89,8 @@ final class HpackDecoder {
     private static final byte READ_LITERAL_HEADER_VALUE_LENGTH = 8;
     private static final byte READ_LITERAL_HEADER_VALUE = 9;
 
+    private final HpackHuffmanDecoder huffmanDecoder = new HpackHuffmanDecoder();
     private final HpackDynamicTable hpackDynamicTable;
-    private final HpackHuffmanDecoder hpackHuffmanDecoder;
     private long maxHeaderListSize;
     private long maxDynamicTableSize;
     private long encoderMaxDynamicTableSize;
@@ -102,23 +102,21 @@ final class HpackDecoder {
      *  This is because <a href="https://tools.ietf.org/html/rfc7540#section-6.5.1">SETTINGS_MAX_HEADER_LIST_SIZE</a>
      *  allows a lower than advertised limit from being enforced, and the default limit is unlimited
      *  (which is dangerous).
-     * @param initialHuffmanDecodeCapacity Size of an intermediate buffer used during huffman decode.
      */
-    HpackDecoder(long maxHeaderListSize, int initialHuffmanDecodeCapacity) {
-        this(maxHeaderListSize, initialHuffmanDecodeCapacity, DEFAULT_HEADER_TABLE_SIZE);
+    HpackDecoder(long maxHeaderListSize) {
+        this(maxHeaderListSize, DEFAULT_HEADER_TABLE_SIZE);
     }
 
     /**
      * Exposed Used for testing only! Default values used in the initial settings frame are overridden intentionally
      * for testing but violate the RFC if used outside the scope of testing.
      */
-    HpackDecoder(long maxHeaderListSize, int initialHuffmanDecodeCapacity, int maxHeaderTableSize) {
+    HpackDecoder(long maxHeaderListSize, int maxHeaderTableSize) {
         this.maxHeaderListSize = checkPositive(maxHeaderListSize, "maxHeaderListSize");
 
         maxDynamicTableSize = encoderMaxDynamicTableSize = maxHeaderTableSize;
         maxDynamicTableSizeChangeRequired = false;
         hpackDynamicTable = new HpackDynamicTable(maxHeaderTableSize);
-        hpackHuffmanDecoder = new HpackHuffmanDecoder(initialHuffmanDecodeCapacity);
     }
 
     /**
@@ -448,7 +446,7 @@ final class HpackDecoder {
 
     private CharSequence readStringLiteral(ByteBuf in, int length, boolean huffmanEncoded) throws Http2Exception {
         if (huffmanEncoded) {
-            return hpackHuffmanDecoder.decode(in, length);
+            return huffmanDecoder.decode(in, length);
         }
         byte[] buf = new byte[length];
         in.readBytes(buf);

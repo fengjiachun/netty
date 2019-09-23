@@ -48,6 +48,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.locks.Lock;
 
+import javax.crypto.spec.SecretKeySpec;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
@@ -370,9 +371,29 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         leak = leakDetection ? leakDetector.track(this) : null;
     }
 
-    final void setKeyMaterial(OpenSslKeyMaterial keyMaterial) throws  Exception {
-        SSL.setKeyMaterial(ssl, keyMaterial.certificateChainAddress(), keyMaterial.privateKeyAddress());
+    final synchronized String[] authMethods() {
+        if (isDestroyed()) {
+            return EmptyArrays.EMPTY_STRINGS;
+        }
+        return SSL.authenticationMethods(ssl);
+    }
+
+    final boolean setKeyMaterial(OpenSslKeyMaterial keyMaterial) throws  Exception {
+        synchronized (this) {
+            if (isDestroyed()) {
+                return false;
+            }
+            SSL.setKeyMaterial(ssl, keyMaterial.certificateChainAddress(), keyMaterial.privateKeyAddress());
+        }
         localCertificateChain = keyMaterial.certificateChain();
+        return true;
+    }
+
+    final synchronized SecretKeySpec masterKey() {
+        if (isDestroyed()) {
+            return null;
+        }
+        return new SecretKeySpec(SSL.getMasterKey(ssl), "AES");
     }
 
     /**
@@ -389,7 +410,9 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         }
 
         synchronized (this) {
-            SSL.setOcspResponse(ssl, response);
+            if (!isDestroyed()) {
+                SSL.setOcspResponse(ssl, response);
+            }
         }
     }
 
@@ -407,6 +430,9 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         }
 
         synchronized (this) {
+            if (isDestroyed()) {
+                return EmptyArrays.EMPTY_BYTES;
+            }
             return SSL.getOcspResponse(ssl);
         }
     }
@@ -733,8 +759,15 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                         // If there is a handshake exception and we have produced data, we should send the data before
                         // we allow handshake() to throw the handshake exception.
                         //
-                        // unwrap(...) will then ensure we propagate the handshake error back to the user.
-                        return newResult(NEED_UNWRAP, 0, bytesProduced);
+                        // When the user calls wrap() again we will propagate the handshake error back to the user as
+                        // soon as there is no more data to was produced (as part of an alert etc).
+                        if (bytesProduced > 0) {
+                            return newResult(NEED_WRAP, 0, bytesProduced);
+                        }
+                        // Nothing was produced see if there is a handshakeException that needs to be propagated
+                        // to the caller by calling handshakeException() which will return the right HandshakeStatus
+                        // if it can "recover" from the exception for now.
+                        return newResult(handshakeException(), 0, 0);
                     }
 
                     status = handshake();
@@ -1717,6 +1750,12 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         checkEngineClosed();
 
         if (handshakeException != null) {
+            // Let's call SSL.doHandshake(...) again in case there is some async operation pending that would fill the
+            // outbound buffer.
+            if (SSL.doHandshake(ssl) <= 0) {
+                // Clear any error that was put on the stack by the handshake
+                SSL.clearError();
+            }
             return handshakeException();
         }
 

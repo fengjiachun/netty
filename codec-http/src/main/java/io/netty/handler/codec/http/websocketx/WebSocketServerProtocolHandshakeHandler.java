@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 The Netty Project
+ * Copyright 2019 The Netty Project
  *
  * The Netty Project licenses this file to you under the Apache License,
  * version 2.0 (the "License"); you may not use this file except in compliance
@@ -44,47 +44,21 @@ import static io.netty.util.internal.ObjectUtil.*;
  */
 class WebSocketServerProtocolHandshakeHandler extends ChannelInboundHandlerAdapter {
 
-    private static final long DEFAULT_HANDSHAKE_TIMEOUT_MS = 10000L;
-
     private final String websocketPath;
     private final String subprotocols;
-    private final boolean allowExtensions;
-    private final int maxFramePayloadSize;
-    private final boolean allowMaskMismatch;
     private final boolean checkStartsWith;
     private final long handshakeTimeoutMillis;
+    private final WebSocketDecoderConfig decoderConfig;
     private ChannelHandlerContext ctx;
     private ChannelPromise handshakePromise;
 
     WebSocketServerProtocolHandshakeHandler(String websocketPath, String subprotocols,
-            boolean allowExtensions, int maxFrameSize, boolean allowMaskMismatch) {
-        this(websocketPath, subprotocols, allowExtensions, maxFrameSize, allowMaskMismatch,
-             DEFAULT_HANDSHAKE_TIMEOUT_MS);
-    }
-
-    WebSocketServerProtocolHandshakeHandler(String websocketPath, String subprotocols,
-                                            boolean allowExtensions, int maxFrameSize,
-                                            boolean allowMaskMismatch, long handshakeTimeoutMillis) {
-        this(websocketPath, subprotocols, allowExtensions, maxFrameSize, allowMaskMismatch,
-             false, handshakeTimeoutMillis);
-    }
-
-    WebSocketServerProtocolHandshakeHandler(String websocketPath, String subprotocols,
-            boolean allowExtensions, int maxFrameSize, boolean allowMaskMismatch, boolean checkStartsWith) {
-        this(websocketPath, subprotocols, allowExtensions, maxFrameSize, allowMaskMismatch,
-             checkStartsWith, DEFAULT_HANDSHAKE_TIMEOUT_MS);
-    }
-
-    WebSocketServerProtocolHandshakeHandler(String websocketPath, String subprotocols,
-                                            boolean allowExtensions, int maxFrameSize, boolean allowMaskMismatch,
-                                            boolean checkStartsWith, long handshakeTimeoutMillis) {
+            boolean checkStartsWith, long handshakeTimeoutMillis, WebSocketDecoderConfig decoderConfig) {
         this.websocketPath = websocketPath;
         this.subprotocols = subprotocols;
-        this.allowExtensions = allowExtensions;
-        maxFramePayloadSize = maxFrameSize;
-        this.allowMaskMismatch = allowMaskMismatch;
         this.checkStartsWith = checkStartsWith;
         this.handshakeTimeoutMillis = checkPositive(handshakeTimeoutMillis, "handshakeTimeoutMillis");
+        this.decoderConfig = checkNotNull(decoderConfig, "decoderConfig");
     }
 
     @Override
@@ -103,18 +77,26 @@ class WebSocketServerProtocolHandshakeHandler extends ChannelInboundHandlerAdapt
 
         try {
             if (!GET.equals(req.method())) {
-                sendHttpResponse(ctx, req, new DefaultFullHttpResponse(HTTP_1_1, FORBIDDEN));
+                sendHttpResponse(ctx, req, new DefaultFullHttpResponse(HTTP_1_1, FORBIDDEN, ctx.alloc().buffer(0)));
                 return;
             }
 
             final WebSocketServerHandshakerFactory wsFactory = new WebSocketServerHandshakerFactory(
-                    getWebSocketLocation(ctx.pipeline(), req, websocketPath), subprotocols,
-                            allowExtensions, maxFramePayloadSize, allowMaskMismatch);
+                    getWebSocketLocation(ctx.pipeline(), req, websocketPath), subprotocols, decoderConfig);
             final WebSocketServerHandshaker handshaker = wsFactory.newHandshaker(req);
             final ChannelPromise localHandshakePromise = handshakePromise;
             if (handshaker == null) {
                 WebSocketServerHandshakerFactory.sendUnsupportedVersionResponse(ctx.channel());
             } else {
+                // Ensure we set the handshaker and replace this handler before we
+                // trigger the actual handshake. Otherwise we may receive websocket bytes in this handler
+                // before we had a chance to replace it.
+                //
+                // See https://github.com/netty/netty/issues/9471.
+                WebSocketServerProtocolHandler.setHandshaker(ctx.channel(), handshaker);
+                ctx.pipeline().replace(this, "WS403Responder",
+                        WebSocketServerProtocolHandler.forbiddenHttpRequestResponder());
+
                 final ChannelFuture handshakeFuture = handshaker.handshake(ctx.channel(), req);
                 handshakeFuture.addListener(new ChannelFutureListener() {
                     @Override
@@ -134,9 +116,6 @@ class WebSocketServerProtocolHandshakeHandler extends ChannelInboundHandlerAdapt
                     }
                 });
                 applyHandshakeTimeout();
-                WebSocketServerProtocolHandler.setHandshaker(ctx.channel(), handshaker);
-                ctx.pipeline().replace(this, "WS403Responder",
-                        WebSocketServerProtocolHandler.forbiddenHttpRequestResponder());
             }
         } finally {
             req.release();
